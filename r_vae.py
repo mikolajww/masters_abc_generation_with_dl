@@ -140,7 +140,40 @@ class GRUSymetricalVAE(torch.nn.Module):
             tune = self.vocab.lookup_tokens(torch.argmax(out_X, dim=-1).cpu().squeeze().tolist())
             return tune
 
+    def generate_tok_by_tok(self, latent_z, bos_idx, eos_idx):
 
+        latent_hidden = self.latent_to_dec_hidden(latent_z)
+        latent_hidden = rearrange(
+            latent_hidden, "b (l h) -> l b h",
+            l=self.encoder_decoder_num_layers,
+            h=self.encoder_decoder_hidden_size
+        )
+
+        generated_tune = []
+        X = torch.tensor([bos_idx], device=DEVICE).long()
+
+        i = 0
+        while X.squeeze().item() != eos_idx:
+            with torch.no_grad():
+                X = rearrange(X, "x -> 1 x")
+                X = self.embedding(X)
+                output, latent_hidden = self.decoder(X, latent_hidden)
+
+                out_X = self.dec_output_to_vocab(output)
+                # Log softmax returns large negative numbers for low probas and near-zero for high probas
+                # last dim is actual embeddings
+                probas = F.softmax(out_X, dim=-1).cpu().squeeze().numpy()
+
+                chosen_index = np.random.choice(len(out_X.squeeze()), p=probas)
+                X = torch.tensor([chosen_index], device=DEVICE).long()
+                # X = torch.argmax(out_X, dim=-1)
+
+                generated_tune.extend(self.vocab.lookup_tokens([chosen_index]))
+                i += 1
+                if i >= 1000:
+                    return "".join(generated_tune)
+
+        return "".join(generated_tune).replace("<EOS>", "")
 def pad_collate(batch):
     (x_batch, y_batch) = zip(*batch)
 
@@ -311,9 +344,9 @@ def evaluate(model_path):
     model.eval()
 
     eos_tok = "<EOS>"
-    sos_idx = model.vocab.lookup_indices(["<EOS>"])[0]
+    bos_idx = model.vocab.lookup_indices(["<BOS>"])[0]
     unk_idx = model.vocab.lookup_indices(["<UNK>"])[0]
-
+    eos_idx = model.vocab.lookup_indices(["<EOS>"])[0]
 
     TRIES = 500
     print(model)
@@ -325,51 +358,51 @@ def evaluate(model_path):
     eval_start = time.perf_counter()
     eval_times = []
     n_of_attempts_list = []
-    for i in tqdm.trange(TRIES):
+    for i in tqdm.trange(1):
         eval_attempt_start = time.perf_counter()
 
         latent_z = torch.randn(model.latent_vector_size, device=DEVICE)
         latent_z = rearrange(latent_z, "z -> 1 z")
+        #generated_tune, tries, n_of_attempts
+        generated_tune = model.generate_tok_by_tok(latent_z, bos_idx, eos_idx) #model.generate(latent_z, sos_idx, unk_idx)
+        print(generated_tune)
 
-        generated_tune, tries, n_of_attempts = model.generate(latent_z, sos_idx, unk_idx)
-
-
-        eval_times.append(time.perf_counter() - eval_attempt_start)
-        with open(f"{tunes_out_folder}/tune_{i}_correct_attempts_{n_of_attempts}.abc", "w") as out:
-            out.writelines(generated_tune)
-        with open(f"{tunes_out_folder}/tune_{i}_incorrect_attempts_{n_of_attempts}.abc", "w") as out:
-            out.writelines(tries)
-        n_of_attempts_list.append(n_of_attempts)
-
-    eval_end = time.perf_counter()
-
-    with open(f"{base_folder}/n_of_tries.txt", "w") as f:
-        f.writelines(str(n_of_attempts_list))
-
-    with open(f"{base_folder}/eval_times.pkl", "wb") as f:
-        pickle.dump(eval_times, f)
-
-    eval_times = np.array(eval_times)
-
-    hist = pickle.load(open(base_folder.joinpath("history.pkl"), "rb"))
-    plt.plot(np.arange(1, len(hist["train"]["loss"]) + 1), hist["train"]["loss"], label="Training loss")
-    plt.plot(np.arange(1, len(hist["val"]["loss"]) + 1), hist["val"]["loss"], label="Validation loss")
-    plt.legend()
-    plt.title(
-        f"Minimum traning loss: {np.array(hist['train']['loss']).min() :.5f}\nMinimum validation loss: {np.array(hist['val']['loss']).min():.5f}")
-    plt.xlabel("Epoch")
-    plt.ylabel("Loss (Crossentropy)")
-    plt.savefig(f"{Path(model_path).parent}/training_val_losses.png")
-    plt.show()
-
-    eval_summary_str = f"Took {eval_end - eval_start:.2f}s to evaluate. [min = {eval_times.min()}, avg = {eval_times.mean()}, max = {eval_times.max()}]"
-    with open(f"{base_folder}/model_summary.txt", "w") as f:
-        f.writelines(pprint.pformat(CONFIG))
-        f.write("\n")
-        f.writelines(str(model))
-        f.writelines(eval_summary_str)
-
-    print(eval_summary_str)
+    #     eval_times.append(time.perf_counter() - eval_attempt_start)
+    #     with open(f"{tunes_out_folder}/tune_{i}_correct_attempts_{n_of_attempts}.abc", "w") as out:
+    #         out.writelines(generated_tune)
+    #     with open(f"{tunes_out_folder}/tune_{i}_incorrect_attempts_{n_of_attempts}.abc", "w") as out:
+    #         out.writelines(tries)
+    #     n_of_attempts_list.append(n_of_attempts)
+    #
+    # eval_end = time.perf_counter()
+    #
+    # with open(f"{base_folder}/n_of_tries.txt", "w") as f:
+    #     f.writelines(str(n_of_attempts_list))
+    #
+    # with open(f"{base_folder}/eval_times.pkl", "wb") as f:
+    #     pickle.dump(eval_times, f)
+    #
+    # eval_times = np.array(eval_times)
+    #
+    # hist = pickle.load(open(base_folder.joinpath("history.pkl"), "rb"))
+    # plt.plot(np.arange(1, len(hist["train"]["loss"]) + 1), hist["train"]["loss"], label="Training loss")
+    # plt.plot(np.arange(1, len(hist["val"]["loss"]) + 1), hist["val"]["loss"], label="Validation loss")
+    # plt.legend()
+    # plt.title(
+    #     f"Minimum traning loss: {np.array(hist['train']['loss']).min() :.5f}\nMinimum validation loss: {np.array(hist['val']['loss']).min():.5f}")
+    # plt.xlabel("Epoch")
+    # plt.ylabel("Loss (Crossentropy)")
+    # plt.savefig(f"{Path(model_path).parent}/training_val_losses.png")
+    # plt.show()
+    #
+    # eval_summary_str = f"Took {eval_end - eval_start:.2f}s to evaluate. [min = {eval_times.min()}, avg = {eval_times.mean()}, max = {eval_times.max()}]"
+    # with open(f"{base_folder}/model_summary.txt", "w") as f:
+    #     f.writelines(pprint.pformat(CONFIG))
+    #     f.write("\n")
+    #     f.writelines(str(model))
+    #     f.writelines(eval_summary_str)
+    #
+    # print(eval_summary_str)
 
 
 DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
