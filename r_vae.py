@@ -11,11 +11,12 @@ import torch
 import torch
 import torch.nn.functional as F
 import tqdm
+from matplotlib import pyplot as plt
 from torch import Tensor
 from einops import rearrange, reduce, repeat
 from torch.nn.utils.rnn import pad_sequence, pack_padded_sequence, pad_packed_sequence
 
-from abc_magisterka_kod.dataset import ABCInMemoryDataset, split_train_valid_test_dataloaders
+from abc_music_generation_with_dl.dataset import ABCInMemoryDataset, split_train_valid_test_dataloaders
 from utils import setup_matplotlib_style
 
 
@@ -90,6 +91,10 @@ class GRUSymetricalVAE(torch.nn.Module):
 
         # TODO replace some tokens with unk at random?
 
+        # Should we fill in
+        #X =
+
+        #X = X.fill()
         X = self.emb_dropout(X)
         # is this necessary?
         packed_X = pack_padded_sequence(X, len_X, batch_first=True, enforce_sorted=False).to(DEVICE)
@@ -106,18 +111,21 @@ class GRUSymetricalVAE(torch.nn.Module):
 
         return out_X, out_len_X, mean, log_variance, z
 
-    def generate(self, latent_z):
+    def generate(self, latent_z, sos_idx, unk_idx):
         # latent z should be of shape (batch_size, latent_size)
+
         with torch.no_grad():
             latent_hidden = self.latent_to_dec_hidden(latent_z)
             latent_hidden = rearrange(
-                latent_hidden, "b (l h) -> l b h ",
+                latent_hidden, "b (l h) -> l b h",
                 l=self.encoder_decoder_num_layers,
                 h=self.encoder_decoder_hidden_size
             )
-
-            X = torch.zeros()
-
+            X = torch.zeros(CONFIG["max_len"], device=DEVICE).fill_(unk_idx).long()
+            X[0] = sos_idx
+            len_X = torch.tensor([len(X)]).long()
+            X = rearrange(X, "x -> 1 x")
+            X = self.embedding(X)
             packed_X = pack_padded_sequence(X, len_X, batch_first=True, enforce_sorted=False).to(DEVICE)
 
             output, _ = self.decoder(packed_X, latent_hidden)
@@ -129,6 +137,8 @@ class GRUSymetricalVAE(torch.nn.Module):
             # Log softmax returns large negative numbers for low probas and near-zero for high probas
             # last dim is actual embeddings
             out_X = F.log_softmax(out_X, dim=-1)
+            tune = self.vocab.lookup_tokens(torch.argmax(out_X, dim=-1).cpu().squeeze().tolist())
+            return tune
 
 
 def pad_collate(batch):
@@ -167,7 +177,8 @@ def padded_kl_nll_loss(predictions, len_predictions,
     kl_weight = float(1 / (1 + np.exp(-k * (step - x0))))
 
     # ELBO Loss
-    loss = (nll_loss + kl_div * kl_weight) / predictions.size(0)
+    l = 1 if predictions.size(0) == 0 else predictions.size(0)
+    loss = (nll_loss + kl_div * kl_weight) / l
     return loss, (nll_loss, kl_div, kl_weight)
 
 
@@ -290,15 +301,19 @@ def train():
     print(f"Experiment saved to {folder_name}")
 
 
-def evaluate(path):
+def evaluate(model_path):
     print(f"Loading model {model_path}")
     state = torch.load(model_path)
     CONFIG = state["CONFIG"]
     model = state["model"]
     model.load_state_dict(state["model_state_dict"])
+    model.to(DEVICE)
     model.eval()
 
     eos_tok = "<EOS>"
+    sos_idx = model.vocab.lookup_indices(["<EOS>"])[0]
+    unk_idx = model.vocab.lookup_indices(["<UNK>"])[0]
+
 
     TRIES = 500
     print(model)
@@ -306,6 +321,55 @@ def evaluate(path):
     base_folder = Path(model_path).parent
     tunes_out_folder = base_folder.joinpath("output_tunes")
     Path.mkdir(tunes_out_folder, exist_ok=True)
+
+    eval_start = time.perf_counter()
+    eval_times = []
+    n_of_attempts_list = []
+    for i in tqdm.trange(TRIES):
+        eval_attempt_start = time.perf_counter()
+
+        latent_z = torch.randn(model.latent_vector_size, device=DEVICE)
+        latent_z = rearrange(latent_z, "z -> 1 z")
+
+        generated_tune, tries, n_of_attempts = model.generate(latent_z, sos_idx, unk_idx)
+
+
+        eval_times.append(time.perf_counter() - eval_attempt_start)
+        with open(f"{tunes_out_folder}/tune_{i}_correct_attempts_{n_of_attempts}.abc", "w") as out:
+            out.writelines(generated_tune)
+        with open(f"{tunes_out_folder}/tune_{i}_incorrect_attempts_{n_of_attempts}.abc", "w") as out:
+            out.writelines(tries)
+        n_of_attempts_list.append(n_of_attempts)
+
+    eval_end = time.perf_counter()
+
+    with open(f"{base_folder}/n_of_tries.txt", "w") as f:
+        f.writelines(str(n_of_attempts_list))
+
+    with open(f"{base_folder}/eval_times.pkl", "wb") as f:
+        pickle.dump(eval_times, f)
+
+    eval_times = np.array(eval_times)
+
+    hist = pickle.load(open(base_folder.joinpath("history.pkl"), "rb"))
+    plt.plot(np.arange(1, len(hist["train"]["loss"]) + 1), hist["train"]["loss"], label="Training loss")
+    plt.plot(np.arange(1, len(hist["val"]["loss"]) + 1), hist["val"]["loss"], label="Validation loss")
+    plt.legend()
+    plt.title(
+        f"Minimum traning loss: {np.array(hist['train']['loss']).min() :.5f}\nMinimum validation loss: {np.array(hist['val']['loss']).min():.5f}")
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss (Crossentropy)")
+    plt.savefig(f"{Path(model_path).parent}/training_val_losses.png")
+    plt.show()
+
+    eval_summary_str = f"Took {eval_end - eval_start:.2f}s to evaluate. [min = {eval_times.min()}, avg = {eval_times.mean()}, max = {eval_times.max()}]"
+    with open(f"{base_folder}/model_summary.txt", "w") as f:
+        f.writelines(pprint.pformat(CONFIG))
+        f.write("\n")
+        f.writelines(str(model))
+        f.writelines(eval_summary_str)
+
+    print(eval_summary_str)
 
 
 DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -315,9 +379,9 @@ CONFIG = OrderedDict([
     ("batch_size", 64),
     ("lr", 0.001),
     ("embedding_size", 256),
-    ("latent_vector_size", 256),
-    ("encoder_decoder_hidden_size", 512),
-    ("encoder_decoder_num_layers", 2),
+    ("latent_vector_size", 64),
+    ("encoder_decoder_hidden_size", 256),
+    ("encoder_decoder_num_layers", 3),
     ("dropout_prob", 0.4),
     ("epochs", 10),
     ("cut_or_filter", "cut"),
@@ -326,9 +390,9 @@ CONFIG = OrderedDict([
 
 if __name__ == "__main__":
     setup_matplotlib_style()
-    mode = "train"
-    # mode = "eval"
-    model_path = "experiment_20220720-162527/RNNSimpleGenerator.pth"
+    # mode = "train"
+    mode = "eval"
+    model_path = "experiment_GRUSymetricalVAE_20220722-210630/GRUSymetricalVAE.pth"
     if mode == "train":
         train()
     elif mode == "eval":
