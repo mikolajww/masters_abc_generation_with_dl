@@ -119,19 +119,16 @@ class ABCInMemoryDataset(Dataset):
 		self.targets = []
 
 		for track in self.tracks_str_array:
-			# t = BOS t1 t2 t3 t4 ... t_n
+			# x = BOS t1 t2 t3 t4 ... t_n
 			# y = t1 t2 t3 t4 t5 ... EOS
-			t = list(track)
-			# pad to max_len
-			# padding = ["<PAD>"] * (self.max_len - len(t) - 1) # -1 for BOS
-			# t.extend(padding)
+			x = list(track)
 			y = list(track)
 			y.append("<EOS>")
-			t.insert(0, "<BOS>")
+			x.insert(0, "<BOS>")
 			# integer encode, convert to np
-			t = torch.tensor(self.text_to_int_encoder(t), device=DEVICE)
+			x = torch.tensor(self.text_to_int_encoder(x), device=DEVICE)
 			y = torch.tensor(self.text_to_int_encoder(y), device=DEVICE)
-			self.data.append(t)
+			self.data.append(x)
 			self.targets.append(y)
 
 	def __len__(self):

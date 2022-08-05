@@ -1,3 +1,7 @@
+import datetime
+import os
+import pickle
+import pprint
 import time
 from collections import OrderedDict
 from functools import partial
@@ -7,17 +11,14 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import tqdm
-from einops import rearrange
+from einops import rearrange, repeat
 from torch.nn.utils.rnn import pad_sequence, pack_padded_sequence, pad_packed_sequence
 
 from dataset import ABCInMemoryDataset, split_train_valid_test_dataloaders
-from models.RecurrentEncoder import RecurrentEncoder
-from models.VAEMuLogVar import VAEMuLogVar
-from utils import setup_matplotlib_style, plot_training_history_from_pickle, save_training_attempt, init_history, \
-    pad_collate
+from utils import setup_matplotlib_style, plot_training_history_from_pickle, pad_collate
 
 
-class RVAE(torch.nn.Module):
+class RVAE_Seq2Seq(torch.nn.Module):
     def __init__(
             self,
             vocab,
@@ -27,34 +28,39 @@ class RVAE(torch.nn.Module):
             latent_dim,
             dropout_prob
     ):
-        super(RVAE, self).__init__()
+        super(RVAE_Seq2Seq, self).__init__()
         self.vocab = vocab
         self.embedding_dim = embedding_dim
         self.enc_dec_hidden = enc_dec_hidden
         self.enc_dec_nlayers = enc_dec_nlayers
+        self.vocab_size = len(vocab)
         self.latent_dim = latent_dim
         self.dropout_prob = dropout_prob
 
         self.embedding = torch.nn.Embedding(
-            num_embeddings=len(vocab),
+            num_embeddings=self.vocab_size,
             embedding_dim=self.embedding_dim
         )
-
-        self.encoder = RecurrentEncoder(
+        self.emb_dropout = torch.nn.Dropout(p=self.dropout_prob)
+        self.encoder = torch.nn.GRU(
             input_size=self.embedding_dim,
-            hidden_dim=self.enc_dec_hidden,
-            n_layers=self.enc_dec_nlayers,
-            rnn_type="GRU"
+            hidden_size=self.enc_dec_hidden,
+            num_layers=self.enc_dec_nlayers,
+            batch_first=True
         )
 
-        self.mulogvar = VAEMuLogVar(
+        self.enc_hidden_to_mean = torch.nn.Linear(
             in_features=self.enc_dec_hidden * self.enc_dec_nlayers,
-            latent_dim=self.latent_dim
+            out_features=self.latent_dim
+        )
+        self.enc_hidden_to_logv = torch.nn.Linear(
+            in_features=self.enc_dec_hidden * self.enc_dec_nlayers,
+            out_features=self.latent_dim
         )
 
-        self.latent_to_dec_hidden = torch.nn.Linear(
+        self.latent_to_dec_input = torch.nn.Linear(
             in_features=self.latent_dim,
-            out_features=self.enc_dec_hidden * self.enc_dec_nlayers
+            out_features=self.embedding_dim
         )
 
         self.decoder = torch.nn.GRU(
@@ -63,112 +69,29 @@ class RVAE(torch.nn.Module):
             num_layers=self.enc_dec_nlayers,
             batch_first=True
         )
-
-        self.emb_dropout = torch.nn.Dropout(p=self.dropout_prob)
-
-        self.dec_output_to_vocab = torch.nn.Linear(self.enc_dec_hidden, len(vocab))
+        self.dec_output_to_vocab = torch.nn.Linear(self.enc_dec_hidden, self.vocab_size)
 
     def forward(self, X, len_X):
         batch_size, padded_sequence_len = X.size()
-        X = self.embedding(X) # X = (batch size, max_len, embedding_size)
-        _, hidden = self.encoder(X, len_X, DEVICE)  # hidden = (num_layers, batch_size, hidden_size)
-
-        z, mu, logvar = self.mulogvar(hidden)
-
-        latent_hidden = self.latent_to_dec_hidden(z)
-        latent_hidden = rearrange(
-            latent_hidden, "b (l h) -> l b h ",
-            b=batch_size, h=self.enc_dec_hidden
-        )
-
-        # X = X.fill()
-        X = self.emb_dropout(X)
-        packed_X = pack_padded_sequence(X, len_X, batch_first=True, enforce_sorted=False).to(DEVICE)
-
-        output, _ = self.decoder(packed_X, latent_hidden)
-
-        # unpack
-        out_X, out_len_X = pad_packed_sequence(output, batch_first=True)
-
-        out_X = self.dec_output_to_vocab(out_X)
-        # Log softmax returns large negative numbers for low probas and near-zero for high probas
-        # last dim is actual embeddings
-        out_X = F.log_softmax(out_X, dim=-1)
-
-        return out_X, out_len_X, mu, logvar, z
-
-    def forward_decoder_random(self, X, len_X):
-        # input is integer encoded and padded with <PAD> token to max_len
-        orig_X = X.detach().clone()
-        batch_size, padded_sequence_len = X.size()
         X = self.embedding(X)
-        # X = (batch size, max_len, embedding_size)
         packed_X = pack_padded_sequence(X, len_X, batch_first=True, enforce_sorted=False).to(DEVICE)
 
         _, latent_hidden = self.encoder(packed_X)
-        # latent_hidden = (num_layers, batch_size, hidden_size)
-        # https://pytorch.org/docs/stable/generated/torch.nn.GRU.html?highlight=gru#torch.nn.GRU
         latent_hidden = rearrange(latent_hidden, "l b h -> b (l h)")
 
         mean = self.enc_hidden_to_mean(latent_hidden)
         log_variance = self.enc_hidden_to_logv(latent_hidden)
         std_dev = torch.exp(0.5 * log_variance)
-
-        # TODO Readup more on that
         z = torch.randn((batch_size, self.latent_dim), device=DEVICE)
         z = mean + z * std_dev
 
-        latent_hidden = self.latent_to_dec_hidden(z)
-        latent_hidden = rearrange(
-            latent_hidden, "b (l h) -> l b h ",
-            b=batch_size, h=self.enc_dec_hidden
-        )
-        # orig_X = (batch_size, len(vocab))
-        X = torch.full_like(orig_X, self.vocab.lookup_indices(["<UNK>"])[0], device=DEVICE)
-        X[:, 0] = self.vocab.lookup_indices(["<BOS>"])[0]
-        X = self.embedding(X)
-        X = self.emb_dropout(X)
-        packed_X = pack_padded_sequence(X, len_X, batch_first=True, enforce_sorted=False).to(DEVICE)
+        decoder_X = self.latent_to_dec_input(z)
+        decoder_X = repeat(decoder_X, "b z -> b repeat z", repeat=padded_sequence_len)
+        packed_X = pack_padded_sequence(decoder_X, len_X, batch_first=True, enforce_sorted=False).to(DEVICE)
 
-        output, _ = self.decoder(packed_X, latent_hidden)
+        output, _ = self.decoder(packed_X)
 
         # unpack
-        out_X, out_len_X = pad_packed_sequence(output, batch_first=True)
-
-        out_X = self.dec_output_to_vocab(out_X)
-        # Log softmax returns large negative numbers for low probas and near-zero for high probas
-        # last dim is actual embeddings
-        out_X = F.log_softmax(out_X, dim=-1)
-
-        return out_X, out_len_X, mean, log_variance, z
-
-    def forward_hidden_to_output(self, X, len_X):
-        batch_size, padded_sequence_len = X.size()  # (batch size, max_len)
-        X = self.embedding(X)  # (batch size, max_len, embedding_size)
-        packed_X = pack_padded_sequence(X, len_X, batch_first=True, enforce_sorted=False).to(DEVICE)  # X - PackedSequence
-        # latent_hidden (hidden state at last timepoint)
-        # https://pytorch.org/docs/stable/generated/torch.nn.GRU.html?highlight=gru#torch.nn.GRU
-        _, latent_hidden = self.encoder(packed_X)  # (num_layers, batch_size, hidden_size)
-
-        latent_hidden = rearrange(latent_hidden, "l b h -> b (l h)")
-
-        mean = self.enc_hidden_to_mean(latent_hidden)  # (batch_size, latent_size)
-        log_variance = self.enc_hidden_to_logv(latent_hidden)  # (batch_size, latent_size)
-        std_dev = torch.exp(0.5 * log_variance)  # (batch_size, latent_size)
-
-        z = torch.randn((batch_size, self.latent_dim), device=DEVICE)
-        z = mean + z * std_dev  # (batch_size, latent_size)
-
-        latent_hidden = self.latent_to_dec_hidden(z)  # (batch_size, num_layers * hidden_size)
-        latent_hidden = rearrange(
-            latent_hidden, "b (l h) -> l b h ",
-            b=batch_size, h=self.enc_dec_hidden
-        )  # (num_layers, batch_size, hidden_size)
-
-        # TODO: THIS PART
-        X = self.emb_dropout(X)
-        packed_X = pack_padded_sequence(X, len_X, batch_first=True, enforce_sorted=False).to(DEVICE) # PackedSequence
-        output, _ = self.decoder(packed_X, latent_hidden)  # (batch_size, max_len, hidden_size)
         out_X, out_len_X = pad_packed_sequence(output, batch_first=True)
 
         out_X = self.dec_output_to_vocab(out_X)
@@ -260,19 +183,22 @@ def padded_kl_nll_loss(predictions, len_predictions,
         nll = nll / len_predictions[i].cuda()
         nll_loss += nll
 
-    # batch_loss = batch_loss / predictions.size(0)
+    l = 1 if predictions.size(0) == 0 else predictions.size(0)
+    nll_loss = nll_loss / l
 
-    kl_div = -0.5 * torch.sum(1 + log_variance - mean.pow(2) - log_variance.exp())
+    # batch_loss = batch_loss / predictions.size(0)
+    kl_div = (-0.5 * torch.sum(log_variance - torch.pow(mean, 2) - torch.exp(log_variance) + 1, dim=1)).mean()
     k, step, x0 = 0.0025, optimizer_step, 2500
-    kl_weight = float(1 / (1 + np.exp(-k * (step - x0))))
+    kl_weight = 1  # float(1 / (1 + np.exp(-k * (step - x0))))
 
     # ELBO Loss
-    l = 1 if predictions.size(0) == 0 else predictions.size(0)
-    loss = (nll_loss + kl_div * kl_weight) / l
+
+
+    loss = (nll_loss + kl_div * kl_weight)
     return loss, (nll_loss, kl_div, kl_weight)
 
 
-def train(training_type="from_input"):
+def train():
     dataset = ABCInMemoryDataset(CONFIG["path_to_abc"], max_len=CONFIG["max_len"], cut_or_filter="cut")
 
     collate = partial(pad_collate, device=DEVICE, pad_idx=dataset.PAD_IDX)
@@ -282,7 +208,7 @@ def train(training_type="from_input"):
         batch_size=CONFIG["batch_size"],
         collate_fn=collate)
 
-    model = RVAE(
+    model = RVAE_Seq2Seq(
         vocab=dataset.vocabulary,
         embedding_dim=CONFIG["embedding_size"],
         enc_dec_hidden=CONFIG["encoder_decoder_hidden_size"],
@@ -297,15 +223,25 @@ def train(training_type="from_input"):
         threshold_mode='rel', cooldown=0, min_lr=0.0000001, eps=1e-08
     )
 
-    history = init_history()
+    history = {
+        "train": {
+            "loss": []
+        },
+        "val": {
+            "loss": []
+        }
+    }
+    epoch_times = []
     model.train()
     optimizer_step = 0
-
-    # kl_history = train/val, epoch, batch, (nll_loss, kl_div, kl_weight)
-    kl_history = torch.tensor(np.zeros((2, CONFIG["epochs"], len(train_data_loader), 3)), device=DEVICE)
+    n_train_batches = len(train_data_loader)
+    # train/val, epoch, batch, (nll_loss, kl_div, kl_weight)
+    kl_history = torch.tensor(np.zeros((2, CONFIG["epochs"], n_train_batches, 3)), device=DEVICE)
     for epoch in range(CONFIG["epochs"]):
+        torch.cuda.empty_cache()
         epoch_start_time = time.perf_counter()
-        minibatch_losses = torch.tensor(np.zeros(len(train_data_loader)), device=DEVICE)
+
+        minibatch_losses = torch.tensor(np.zeros(n_train_batches), device=DEVICE)
 
         for i, (batch_X, batch_y, len_X, len_y) in enumerate(tqdm.tqdm(train_data_loader)):
             # this is equivalent to optimizer.zero_grad()
@@ -313,13 +249,10 @@ def train(training_type="from_input"):
             # set_to_none supposedly is more efficient as per
             # https://tigress-web.princeton.edu/~jdh4/PyTorchPerformanceTuningGuide_GTC2021.pdf
             model.zero_grad(set_to_none=True)
-            if training_type == "from_unk":
-                predictions, len_predictions, mean, log_variance, z = model.forward_decoder_random(batch_X, len_X)
-            else:
-                predictions, len_predictions, mean, log_variance, z = model(batch_X, len_X)
-            targets = batch_y.long()
+            predictions, len_predictions, mean, log_variance, z = model(batch_X, len_X)
+            # Train as Autoencoder
             loss, (nll_loss, kl_div, kl_weight) = padded_kl_nll_loss(
-                predictions, len_predictions, targets, len_y, mean, log_variance, optimizer_step
+                predictions, len_predictions, batch_X.long(), len_X, mean, log_variance, optimizer_step
             )
             kl_history[0, epoch, i] = torch.tensor([nll_loss, kl_div, kl_weight], device=DEVICE)
             minibatch_losses[i] = loss
@@ -329,7 +262,7 @@ def train(training_type="from_input"):
             optimizer_step += 1
 
             if i % 50 == 0:
-                tqdm.tqdm.write(f"Epoch {epoch + 1}/{CONFIG['epochs']} - Loss: {loss.item()}")
+                tqdm.tqdm.write(f"Epoch {epoch + 1}/{CONFIG['epochs']} - Loss: {loss.item()} [nll_loss = {nll_loss.item()}, kl_div = {kl_div.item()}, kl_weight = {kl_weight}]")
 
         history["train"]["loss"].append(torch.nanmean(minibatch_losses).item())
 
@@ -346,13 +279,37 @@ def train(training_type="from_input"):
 
         history["val"]["loss"].append(torch.nanmean(val_minibatch_losses).item())
         epoch_time = time.perf_counter() - epoch_start_time
-        history["epoch_times"].append(epoch_time)
+        epoch_times.append(epoch_time)
         tqdm.tqdm.write(
             f"Epoch {epoch + 1}: [{epoch_time:.2f}s] Train loss: {history['train']['loss'][epoch]} | Val loss: {history['val']['loss'][epoch]}")
 
         scheduler.step(val_loss)
 
-    save_training_attempt(model, CONFIG, history, np_extra={"kl_history": kl_history.cpu().numpy()})
+    state = {
+        "model_state_dict": model.state_dict(),
+        "CONFIG": CONFIG,
+        "model": model
+    }
+
+    folder_name = f"experiment_{model.__class__.__name__}_{datetime.datetime.now().strftime('%Y%m%d-%H%M%S')}"
+    os.mkdir(folder_name)
+    save_filename = f"{model.__class__.__name__}.pth"
+    torch.save(state, f"{folder_name}/{save_filename}")
+    pickle.dump(history, open(f"{folder_name}/history.pkl", "wb"))
+    np.save(f"{folder_name}/kl_history.npy", kl_history.cpu().numpy())
+
+    with open(f"{folder_name}/params.txt", "w") as f:
+        f.writelines(pprint.pformat(CONFIG))
+    with open(f"{folder_name}/time.txt", "w") as f:
+        f.writelines(str(epoch_times))
+
+    with open(f"{folder_name}/experimet_summary.txt", "a") as f:
+        f.writelines(folder_name + "\n")
+        f.writelines(pprint.pformat(CONFIG) + "\n")
+        f.write(f"Time : {np.array(epoch_times).mean() :.2f}\n")
+        f.write("\n\n")
+
+    print(f"Experiment saved to {folder_name}")
 
 
 def evaluate(model_path):
@@ -424,23 +381,23 @@ DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 CONFIG = OrderedDict([
     ("path_to_abc", "../data_processed/abc_parsed_cleanup2.abc"),
     ("batch_size", 64),
-    ("lr", 0.001),
-    ("embedding_size", 256),
-    ("latent_vector_size", 1024),
-    ("encoder_decoder_hidden_size", 512),
-    ("encoder_decoder_num_layers", 3),
+    ("lr", 0.01),
+    ("embedding_size", 32),
+    ("latent_vector_size", 256),
+    ("encoder_decoder_hidden_size", 256),
+    ("encoder_decoder_num_layers", 2),
     ("dropout_prob", 0.3),
-    ("epochs", 20),
-    ("cut_or_filter", "cut"),
-    ("max_len", 300)
+    ("epochs", 10),
+    ("cut_or_filter", "filter"),
+    ("max_len", 700)
 ])
 
 if __name__ == "__main__":
     setup_matplotlib_style()
-    # mode = "train"
-    mode = "eval"
+    mode = "train"
+    # mode = "eval"
     model_path = "experiment_GRUSymetricalVAE_20220727-094750/GRUSymetricalVAE.pth"
     if mode == "train":
-        train(training_type="from_unk")
+        train()
     elif mode == "eval":
         evaluate(model_path)
