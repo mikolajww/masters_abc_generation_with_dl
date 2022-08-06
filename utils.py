@@ -14,9 +14,9 @@ import pickle
 import numpy as np
 from torch.nn.utils.rnn import pad_sequence
 
-meter_pattern = r"M: ?[0-9]/[0-9]\n"
+meter_pattern = r"M: ?((C\|?)|([0-9][0-9]?/[0-9][0-9]?))\n"
 length_pattern = r"L: ?1/(1|2|4|8|16|32|64|128|256|512)\n"
-key_pattern = r"K: ?((C\|?)|([A-G][b#]?(mix|dor|phr|lyd|loc|m)?))\n"
+key_pattern = r"K: ?([A-G][b#]?(mix|dor|phr|lyd|loc|m)?)\n"
 tune = r"[\d\D]+"
 
 header_permutations = permutations([meter_pattern, key_pattern, length_pattern])
@@ -55,7 +55,7 @@ def get_sizeof(var, suffix='B'):
 
 
 def is_valid_abc(tune):
-    return bool(re.match(valid_abc_pattern, tune))
+    return bool(re.search(valid_abc_pattern, tune))
 
 
 # base_folder.joinpath("history.pkl")
@@ -107,16 +107,16 @@ def save_training_attempt(model, CONFIG, history, picklable_extra=None, np_extra
     print(f"Experiment saved to {folder_name}")
 
     if np_extra is not None:
-        for name, value in np_extra:
+        for name, value in np_extra.items():
             np.save(f"{folder_name}/{name}.npy", value)
 
     if txt_extra is not None:
-        for name, value in txt_extra:
+        for name, value in txt_extra.items():
             with open(f"{folder_name}/{name}.txt", "w") as f:
                 f.writelines(value)
 
     if picklable_extra is not None:
-        for name, value in picklable_extra:
+        for name, value in picklable_extra.items():
             pickle.dump(value, open(f"{folder_name}/{name}.pkl", "wb"))
 
 

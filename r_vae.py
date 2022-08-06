@@ -73,7 +73,7 @@ class RVAE(torch.nn.Module):
         X = self.embedding(X) # X = (batch size, max_len, embedding_size)
         _, hidden = self.encoder(X, len_X, DEVICE)  # hidden = (num_layers, batch_size, hidden_size)
 
-        z, mu, logvar = self.mulogvar(hidden)
+        z, mu, logvar = self.mulogvar(hidden, DEVICE)
 
         latent_hidden = self.latent_to_dec_hidden(z)
         latent_hidden = rearrange(
@@ -81,9 +81,9 @@ class RVAE(torch.nn.Module):
             b=batch_size, h=self.enc_dec_hidden
         )
 
-        # X = X.fill()
-        X = self.emb_dropout(X)
-        packed_X = pack_padded_sequence(X, len_X, batch_first=True, enforce_sorted=False).to(DEVICE)
+        #X = self.emb_dropout(X)
+        decoder_input = torch.zeros_like(X)
+        packed_X = pack_padded_sequence(decoder_input, len_X, batch_first=True, enforce_sorted=False).to(DEVICE)
 
         output, _ = self.decoder(packed_X, latent_hidden)
 
@@ -308,15 +308,9 @@ def train(training_type="from_input"):
         minibatch_losses = torch.tensor(np.zeros(len(train_data_loader)), device=DEVICE)
 
         for i, (batch_X, batch_y, len_X, len_y) in enumerate(tqdm.tqdm(train_data_loader)):
-            # this is equivalent to optimizer.zero_grad()
-            # reset gradients every minibatch!
-            # set_to_none supposedly is more efficient as per
-            # https://tigress-web.princeton.edu/~jdh4/PyTorchPerformanceTuningGuide_GTC2021.pdf
+
             model.zero_grad(set_to_none=True)
-            if training_type == "from_unk":
-                predictions, len_predictions, mean, log_variance, z = model.forward_decoder_random(batch_X, len_X)
-            else:
-                predictions, len_predictions, mean, log_variance, z = model(batch_X, len_X)
+            predictions, len_predictions, mean, log_variance, z = model(batch_X, len_X)
             targets = batch_y.long()
             loss, (nll_loss, kl_div, kl_weight) = padded_kl_nll_loss(
                 predictions, len_predictions, targets, len_y, mean, log_variance, optimizer_step
@@ -329,7 +323,7 @@ def train(training_type="from_input"):
             optimizer_step += 1
 
             if i % 50 == 0:
-                tqdm.tqdm.write(f"Epoch {epoch + 1}/{CONFIG['epochs']} - Loss: {loss.item()}")
+                tqdm.tqdm.write(f"Epoch {epoch + 1}/{CONFIG['epochs']} - Loss: {loss.item()} [nll_loss = {nll_loss.item()}, kl_div = {kl_div.item()}, kl_weight = {kl_weight}]")
 
         history["train"]["loss"].append(torch.nanmean(minibatch_losses).item())
 
@@ -425,20 +419,20 @@ CONFIG = OrderedDict([
     ("path_to_abc", "../data_processed/abc_parsed_cleanup2.abc"),
     ("batch_size", 64),
     ("lr", 0.001),
-    ("embedding_size", 256),
-    ("latent_vector_size", 1024),
-    ("encoder_decoder_hidden_size", 512),
-    ("encoder_decoder_num_layers", 3),
+    ("embedding_size", 32),
+    ("latent_vector_size", 64),
+    ("encoder_decoder_hidden_size", 256),
+    ("encoder_decoder_num_layers", 1),
     ("dropout_prob", 0.3),
-    ("epochs", 20),
-    ("cut_or_filter", "cut"),
-    ("max_len", 300)
+    ("epochs", 1),
+    ("cut_or_filter", "filter"),
+    ("max_len", 80)
 ])
 
 if __name__ == "__main__":
     setup_matplotlib_style()
-    # mode = "train"
-    mode = "eval"
+    mode = "train"
+    # mode = "eval"
     model_path = "experiment_GRUSymetricalVAE_20220727-094750/GRUSymetricalVAE.pth"
     if mode == "train":
         train(training_type="from_unk")

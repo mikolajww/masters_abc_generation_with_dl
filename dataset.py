@@ -7,6 +7,7 @@ import torch
 # os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:256"
 import torchtext
 from torch.utils.data import Dataset, DataLoader
+import seaborn as sns
 
 from utils import get_sizeof, setup_matplotlib_style
 
@@ -84,17 +85,16 @@ class ABCDataset(Dataset):
 
 class ABCInMemoryDataset(Dataset):
 
-	def __init__(self, abc_file_dir, max_len, cut_or_filter="filter"):
+	def __init__(self, abc_file_dir, max_len, min_len=0, cut_or_filter="filter"):
 		self.tracks_str_array = read_file_to_str_array(abc_file_dir)
 		self.max_len = max_len
+		self.min_len = min_len
 		if cut_or_filter == "filter":
 			self.tracks_str_array = list(
-				filter(lambda s: (len(s) <= self.max_len - 2) and (len(s) > 0), self.tracks_str_array))
+				filter(lambda s: (len(s) <= self.max_len - 2) and (len(s) > min_len), self.tracks_str_array))
 		elif cut_or_filter == "cut":
 			self.tracks_str_array = list(
-				filter(lambda x: len(x) > 0, map(lambda s: s[:max_len - 2], self.tracks_str_array)))
-		else:
-			raise ValueError("cut_or_filter can only be set to 'cut' or 'filter'")
+				filter(lambda x: len(x) > min_len, map(lambda s: s[:max_len - 2], self.tracks_str_array)))
 
 		def yield_tokens(tracks_string_array):
 			for track in tracks_string_array:
@@ -145,12 +145,16 @@ def investigate_data(dataset):
 	track_lengths = list(map(lambda x: len(x), dataset.tracks_str_array))
 	track_lengths = np.array(track_lengths)
 	longest_track_idx = np.argmax(track_lengths)
-
+	shortest_track_idx = np.argmin(track_lengths)
+	print(f"Shortest track [idx = {shortest_track_idx}] : {dataset.tracks_str_array[shortest_track_idx]}")
 	print(np.mean(track_lengths))
 
 	print(f"Total tracks: {len(dataset.tracks_str_array)}")
 	print(
 		f"Track length (chars): min={np.min(track_lengths)}, mean={np.mean(track_lengths)}, max={np.max(track_lengths)}")
+
+	len_sorted = sorted(track_lengths)
+	print(f"Top 25 smallest lengths: {len_sorted[:25]}, top 25 largest: {len_sorted[-25:]}")
 
 	LEN_TRESH = 800
 	longer_than_thresh = len(track_lengths[track_lengths > LEN_TRESH])
@@ -172,6 +176,10 @@ def investigate_data(dataset):
 	plt.ylabel("Number of tunes")
 	plt.xlabel("Number of tokens in a tune")
 	plt.hist(track_lengths, bins=np.arange(0, LEN_TRESH, step=50), edgecolor='black', linewidth=0.5)
+	plt.show()
+
+	sns.boxplot(x=track_lengths)
+	plt.ylim([0, 20000])
 	plt.show()
 
 def split_train_valid_test_dataloaders(
@@ -212,9 +220,9 @@ def split_train_valid_test_dataloaders(
 DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 if __name__ == "__main__":
-	path_to_abc = '../data_processed/abc_parsed_cleanup2.abc'
+	path_to_abc = '../data_processed/abc_parsed_cleanup4.abc'
 	start_time = time.perf_counter()
-	dataset = ABCInMemoryDataset("../data_processed/abc_parsed_cleanup2.abc", max_len=10000, cut_or_filter="cut")
+	dataset = ABCInMemoryDataset(path_to_abc, min_len=0, max_len=100000, cut_or_filter="filter")
 	print(f"Took {time.perf_counter() - start_time} to load the dataset")
 	investigate_data(dataset)
 
