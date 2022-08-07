@@ -119,6 +119,7 @@ def save_training_attempt(model, CONFIG, history, picklable_extra=None, np_extra
         for name, value in picklable_extra.items():
             pickle.dump(value, open(f"{folder_name}/{name}.pkl", "wb"))
 
+    return f"{folder_name}/{save_filename}"
 
 def save_evaluation_attempt():
     ...

@@ -12,8 +12,17 @@ class VAEMuLogVar(nn.Module):
         super().__init__()
         self.latent_dim = latent_dim
 
-        self.mu = nn.Linear(in_features=in_features, out_features=latent_dim)
-        self.logvar = nn.Linear(in_features=in_features, out_features=latent_dim)
+        self.mu = nn.Sequential(
+            nn.Linear(in_features=in_features, out_features=2 * latent_dim),
+            nn.SELU(),
+            nn.Linear(in_features=2 * latent_dim, out_features=latent_dim)
+        )
+
+        self.logvar = nn.Sequential(
+            nn.Linear(in_features=in_features, out_features=2 * latent_dim),
+            nn.SELU(),
+            nn.Linear(in_features=2 * latent_dim, out_features=latent_dim)
+        )
 
     def forward(self, X, device):
 

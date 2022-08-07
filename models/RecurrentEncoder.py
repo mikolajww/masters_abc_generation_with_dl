@@ -12,6 +12,7 @@ class RecurrentEncoder(nn.Module):
             n_layers: int,
             hidden_dim: int,
             rnn_type: str = "GRU",
+            bidirectional: bool = True,
             **kwargs
     ) -> None:
         super().__init__()
@@ -25,17 +26,16 @@ class RecurrentEncoder(nn.Module):
             hidden_size=hidden_dim,
             num_layers=n_layers,
             batch_first=True,
+            bidirectional=bidirectional,
             **kwargs
         )
 
-
-    def forward(self, X, len_X, device):
+    def forward(self, X, len_X, device, use_packed=False):
         # X = (batch size, max_len, embedding_size)
         # len_X = [len(x) for x in X]
-        packed_X = pack_padded_sequence(X, len_X, batch_first=True, enforce_sorted=False).to(device)
-
-        # output = (batch size, sequence length, hidden_dim)
-        output, hidden = self.encoder(packed_X)
-        hidden = rearrange(hidden, "l b h -> b (l h)")
+        if use_packed:
+            X = pack_padded_sequence(X, len_X, batch_first=True, enforce_sorted=False).to(device)
+            # output = (batch_size, sequence_length, D * hidden_dim)
+            # hidden = (D * num_layers, batch_size, hidden_dim)
+        output, hidden = self.encoder(X)
         return output, hidden
-    

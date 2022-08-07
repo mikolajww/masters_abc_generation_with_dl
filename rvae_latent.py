@@ -1,7 +1,3 @@
-import datetime
-import os
-import pickle
-import pprint
 import time
 from collections import OrderedDict
 from functools import partial
@@ -9,16 +5,21 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 import tqdm
 from einops import rearrange, repeat
 from torch.nn.utils.rnn import pad_sequence, pack_padded_sequence, pad_packed_sequence
 
 from dataset import ABCInMemoryDataset, split_train_valid_test_dataloaders
-from utils import setup_matplotlib_style, plot_training_history_from_pickle, pad_collate
+from models.RecurrentEncoder import RecurrentEncoder
+from models.VAEMuLogVar import VAEMuLogVar
+from losses import padded_kl_nll_loss, padded_kl_ce_loss, ce_kl
+from utils import setup_matplotlib_style, plot_training_history_from_pickle, save_training_attempt, init_history, \
+    pad_collate
 
 
-class RVAE_Seq2Seq(torch.nn.Module):
+class RVAELatent(nn.Module):
     def __init__(
             self,
             vocab,
@@ -26,104 +27,109 @@ class RVAE_Seq2Seq(torch.nn.Module):
             enc_dec_hidden,
             enc_dec_nlayers,
             latent_dim,
-            dropout_prob
+            dropout_prob,
+            pad_idx,
+            max_len
     ):
-        super(RVAE_Seq2Seq, self).__init__()
+        super(RVAELatent, self).__init__()
         self.vocab = vocab
         self.embedding_dim = embedding_dim
         self.enc_dec_hidden = enc_dec_hidden
         self.enc_dec_nlayers = enc_dec_nlayers
-        self.vocab_size = len(vocab)
         self.latent_dim = latent_dim
         self.dropout_prob = dropout_prob
 
-        self.embedding = torch.nn.Embedding(
-            num_embeddings=self.vocab_size,
-            embedding_dim=self.embedding_dim
+        self.embedding = nn.Embedding(
+            num_embeddings=len(vocab),
+            embedding_dim=self.embedding_dim,
+            padding_idx=pad_idx
         )
+
+        self.encoder = RecurrentEncoder(
+            input_size=self.embedding_dim,
+            hidden_dim=self.enc_dec_hidden,
+            n_layers=self.enc_dec_nlayers,
+            rnn_type="GRU",
+            dropout=dropout_prob
+        )
+
+        self.mulogvar = VAEMuLogVar(
+            in_features=self.enc_dec_hidden * self.enc_dec_nlayers,
+            latent_dim=self.latent_dim
+        )
+
+        self.latent_to_dec_hidden = nn.Sequential(
+            nn.Linear(self.latent_dim, self.enc_dec_hidden * self.enc_dec_nlayers),
+            nn.GELU()
+        )
+
+        self.latent_to_dec_input = nn.Sequential(
+            nn.Linear(self.latent_dim, self.embedding_dim),
+            nn.GELU()
+        )
+
+        self.decoder = nn.GRU(
+            input_size=self.embedding_dim,
+            hidden_size=self.enc_dec_hidden,
+            num_layers=self.enc_dec_nlayers,
+            batch_first=True,
+            dropout=dropout_prob
+        )
+
         self.emb_dropout = torch.nn.Dropout(p=self.dropout_prob)
-        self.encoder = torch.nn.GRU(
-            input_size=self.embedding_dim,
-            hidden_size=self.enc_dec_hidden,
-            num_layers=self.enc_dec_nlayers,
-            batch_first=True
-        )
 
-        self.enc_hidden_to_mean = torch.nn.Linear(
-            in_features=self.enc_dec_hidden * self.enc_dec_nlayers,
-            out_features=self.latent_dim
-        )
-        self.enc_hidden_to_logv = torch.nn.Linear(
-            in_features=self.enc_dec_hidden * self.enc_dec_nlayers,
-            out_features=self.latent_dim
-        )
-
-        self.latent_to_dec_input = torch.nn.Linear(
-            in_features=self.latent_dim,
-            out_features=self.embedding_dim
-        )
-
-        self.decoder = torch.nn.GRU(
-            input_size=self.embedding_dim,
-            hidden_size=self.enc_dec_hidden,
-            num_layers=self.enc_dec_nlayers,
-            batch_first=True
-        )
-        self.dec_output_to_vocab = torch.nn.Linear(self.enc_dec_hidden, self.vocab_size)
+        self.dec_output_to_vocab = torch.nn.Linear(self.enc_dec_hidden, len(vocab))
 
     def forward(self, X, len_X):
         batch_size, padded_sequence_len = X.size()
-        X = self.embedding(X)
-        packed_X = pack_padded_sequence(X, len_X, batch_first=True, enforce_sorted=False).to(DEVICE)
+        embedded = self.embedding(X)  # X = (batch size, max_len, embedding_size)
+        _, hidden = self.encoder(embedded, len_X, DEVICE)  # hidden = (num_layers, batch_size, hidden_size)
 
-        _, latent_hidden = self.encoder(packed_X)
-        latent_hidden = rearrange(latent_hidden, "l b h -> b (l h)")
+        z, mu, logvar = self.mulogvar(rearrange(hidden, "l b h -> b (l h)"), DEVICE)
 
-        mean = self.enc_hidden_to_mean(latent_hidden)
-        log_variance = self.enc_hidden_to_logv(latent_hidden)
-        std_dev = torch.exp(0.5 * log_variance)
-        z = torch.randn((batch_size, self.latent_dim), device=DEVICE)
-        z = mean + z * std_dev
+        latent_hidden = rearrange(
+            self.latent_to_dec_hidden(z), "b (l h) -> l b h ",
+            b=batch_size, h=self.enc_dec_hidden
+        )
 
-        decoder_X = self.latent_to_dec_input(z)
-        decoder_X = repeat(decoder_X, "b z -> b repeat z", repeat=padded_sequence_len)
-        packed_X = pack_padded_sequence(decoder_X, len_X, batch_first=True, enforce_sorted=False).to(DEVICE)
+        decoder_input = self.latent_to_dec_input(z)
+        decoder_input = repeat(decoder_input, "b e -> b repeat e", repeat=padded_sequence_len)
+        packed_X = pack_padded_sequence(decoder_input, len_X, batch_first=True, enforce_sorted=False).to(DEVICE)
 
-        output, _ = self.decoder(packed_X)
+        if self.enc_dec_nlayers == 1:
+            hidden = rearrange(hidden, "b h -> 1 b h")
 
-        # unpack
+        output, _ = self.decoder(packed_X, latent_hidden)
         out_X, out_len_X = pad_packed_sequence(output, batch_first=True)
 
         out_X = self.dec_output_to_vocab(out_X)
         # Log softmax returns large negative numbers for low probas and near-zero for high probas
         # last dim is actual embeddings
-        out_X = F.log_softmax(out_X, dim=-1)
+        # out_X = F.log_softmax(out_X, dim=-1)
 
-        return out_X, out_len_X, mean, log_variance, z
+        return out_X, out_len_X, mu, logvar, z
 
     def generate(self, latent_z, sos_idx, unk_idx):
         # latent z should be of shape (batch_size, latent_size)
 
         with torch.no_grad():
-            latent_hidden = self.latent_to_dec_hidden(latent_z)
-            latent_hidden = rearrange(
-                latent_hidden, "b (l h) -> l b h",
-                l=self.enc_dec_nlayers,
-                h=self.enc_dec_hidden
+            # latent_hidden = self.latent_to_dec_hidden(latent_z)
+            # latent_hidden = rearrange(
+            #     latent_hidden, "b (l h) -> l b h",
+            #     l=self.enc_dec_nlayers,
+            #     h=self.enc_dec_hidden
+            # )
+            decoder_hidden = rearrange(
+                self.latent_to_dec_hidden(latent_z), "b (l h) -> l b h ",
+                b=1, h=self.enc_dec_hidden
             )
-            X = torch.zeros(CONFIG["max_len"], device=DEVICE).fill_(unk_idx).long()
-            X[0] = sos_idx
-            len_X = torch.tensor([len(X)]).long()
-            X = rearrange(X, "x -> 1 x")
-            X = self.embedding(X)
-            packed_X = pack_padded_sequence(X, len_X, batch_first=True, enforce_sorted=False).to(DEVICE)
 
-            output, _ = self.decoder(packed_X, latent_hidden)
+            decoder_input = self.latent_to_dec_input(latent_z)
+            decoder_input = repeat(decoder_input, "b e -> b repeat e", repeat=CONFIG["max_len"])
 
-            # unpack
-            out_X, out_len_X = pad_packed_sequence(output, batch_first=True)
+            output, _ = self.decoder(decoder_input, decoder_hidden)
 
-            out_X = self.dec_output_to_vocab(out_X)
+            out_X = self.dec_output_to_vocab(output)
             # Log softmax returns large negative numbers for low probas and near-zero for high probas
             # last dim is actual embeddings
             out_X = F.log_softmax(out_X, dim=-1)
@@ -166,93 +172,57 @@ class RVAE_Seq2Seq(torch.nn.Module):
         return "".join(generated_tune).replace("<EOS>", "")
 
 
-def padded_kl_nll_loss(predictions, len_predictions,
-                       targets, len_targets,
-                       mean, log_variance,
-                       optimizer_step):
-    # KL Annealing https://arxiv.org/pdf/1511.06349.pdf
-    nll_loss = torch.tensor(0.0, device=DEVICE)
-
-    for i in range(predictions.size(0)):
-        nll = F.nll_loss(
-            predictions[i][:len_predictions[i]],
-            targets[i][:len_targets[i]],
-            reduction="sum",
-            ignore_index=0
-        )
-        nll = nll / len_predictions[i].cuda()
-        nll_loss += nll
-
-    l = 1 if predictions.size(0) == 0 else predictions.size(0)
-    nll_loss = nll_loss / l
-
-    # batch_loss = batch_loss / predictions.size(0)
-    kl_div = (-0.5 * torch.sum(log_variance - torch.pow(mean, 2) - torch.exp(log_variance) + 1, dim=1)).mean()
-    k, step, x0 = 0.0025, optimizer_step, 2500
-    kl_weight = 1  # float(1 / (1 + np.exp(-k * (step - x0))))
-
-    # ELBO Loss
-
-
-    loss = (nll_loss + kl_div * kl_weight)
-    return loss, (nll_loss, kl_div, kl_weight)
-
-
 def train():
-    dataset = ABCInMemoryDataset(CONFIG["path_to_abc"], max_len=CONFIG["max_len"], cut_or_filter="cut")
+    dataset = ABCInMemoryDataset(
+        CONFIG["path_to_abc"],
+        min_len=CONFIG["min_len"],
+        max_len=CONFIG["max_len"],
+        cut_or_filter=CONFIG["cut_or_filter"],
+        min_freq=0
+    )
 
     collate = partial(pad_collate, device=DEVICE, pad_idx=dataset.PAD_IDX)
 
     train_data_loader, valid_data_loader, test_data_loader = split_train_valid_test_dataloaders(
-        dataset, train_percent=0.8, valid_percent=0.1,
+        dataset, train_percent=0.7, valid_percent=0.2,
         batch_size=CONFIG["batch_size"],
         collate_fn=collate)
 
-    model = RVAE_Seq2Seq(
+    loss_fn = partial(padded_kl_ce_loss, device=DEVICE)
+
+    model = RVAELatent(
         vocab=dataset.vocabulary,
         embedding_dim=CONFIG["embedding_size"],
         enc_dec_hidden=CONFIG["encoder_decoder_hidden_size"],
         enc_dec_nlayers=CONFIG["encoder_decoder_num_layers"],
         latent_dim=CONFIG["latent_vector_size"],
-        dropout_prob=CONFIG["dropout_prob"]
+        dropout_prob=CONFIG["dropout_prob"],
+        max_len=CONFIG["max_len"],
+        pad_idx=dataset.PAD_IDX
     ).to(DEVICE)
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+    optimizer = torch.optim.Adam(model.parameters(), lr=CONFIG["lr"])
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode='min', factor=0.1, patience=2, verbose=True, threshold=0.0001,
         threshold_mode='rel', cooldown=0, min_lr=0.0000001, eps=1e-08
     )
 
-    history = {
-        "train": {
-            "loss": []
-        },
-        "val": {
-            "loss": []
-        }
-    }
-    epoch_times = []
+    history = init_history()
     model.train()
     optimizer_step = 0
-    n_train_batches = len(train_data_loader)
-    # train/val, epoch, batch, (nll_loss, kl_div, kl_weight)
-    kl_history = torch.tensor(np.zeros((2, CONFIG["epochs"], n_train_batches, 3)), device=DEVICE)
+
+    # kl_history = train/val, epoch, batch, (nll_loss, kl_div, kl_weight)
+    kl_history = torch.tensor(np.zeros((2, CONFIG["epochs"], len(train_data_loader), 3)), device=DEVICE)
     for epoch in range(CONFIG["epochs"]):
-        torch.cuda.empty_cache()
         epoch_start_time = time.perf_counter()
-
-        minibatch_losses = torch.tensor(np.zeros(n_train_batches), device=DEVICE)
-
-        for i, (batch_X, batch_y, len_X, len_y) in enumerate(tqdm.tqdm(train_data_loader)):
-            # this is equivalent to optimizer.zero_grad()
-            # reset gradients every minibatch!
-            # set_to_none supposedly is more efficient as per
-            # https://tigress-web.princeton.edu/~jdh4/PyTorchPerformanceTuningGuide_GTC2021.pdf
+        minibatch_losses = torch.tensor(np.zeros(len(train_data_loader)), device=DEVICE)
+        # tqdm.tqdm(train_data_loader)
+        for i, (batch_X, _, len_X, _) in enumerate(tqdm.tqdm(train_data_loader)):
             model.zero_grad(set_to_none=True)
             predictions, len_predictions, mean, log_variance, z = model(batch_X, len_X)
-            # Train as Autoencoder
-            loss, (nll_loss, kl_div, kl_weight) = padded_kl_nll_loss(
-                predictions, len_predictions, batch_X.long(), len_X, mean, log_variance, optimizer_step
+            # try to reconstruct
+            loss, (nll_loss, kl_div, kl_weight) = loss_fn(
+                predictions, len_X, batch_X, len_X, mean, log_variance, optimizer_step=None
             )
             kl_history[0, epoch, i] = torch.tensor([nll_loss, kl_div, kl_weight], device=DEVICE)
             minibatch_losses[i] = loss
@@ -262,6 +232,16 @@ def train():
             optimizer_step += 1
 
             if i % 50 == 0:
+                predicted = F.log_softmax(predictions[0, :, :], dim=-1)
+                tune = model.vocab.lookup_tokens(torch.argmax(predicted, dim=-1).cpu().squeeze().tolist())
+                print("Predicted: ", "".join(tune).replace("\n", ""))
+                print("Target: ",
+                      "".join(
+                          model.vocab.lookup_tokens(batch_X[0, :].cpu().tolist())
+                      ).replace("\n", "")
+                )
+
+
                 tqdm.tqdm.write(f"Epoch {epoch + 1}/{CONFIG['epochs']} - Loss: {loss.item()} [nll_loss = {nll_loss.item()}, kl_div = {kl_div.item()}, kl_weight = {kl_weight}]")
 
         history["train"]["loss"].append(torch.nanmean(minibatch_losses).item())
@@ -271,45 +251,20 @@ def train():
             val_minibatch_losses = torch.tensor(np.zeros(n_batches), device=DEVICE)
             for i, (batch_X, batch_y, len_X, len_y) in enumerate(valid_data_loader):
                 predictions, len_predictions, mean, log_variance, z = model(batch_X, len_X)
-                targets = batch_y.long()
-                val_loss, (nll_loss, kl_div, kl_weight) = padded_kl_nll_loss(
-                    predictions, len_predictions, targets, len_y, mean, log_variance, optimizer_step
+                val_loss, (nll_loss, kl_div, kl_weight) = loss_fn(
+                    predictions, len_X, batch_X, len_X, mean, log_variance, optimizer_step=None
                 )
                 val_minibatch_losses[i] = val_loss
 
         history["val"]["loss"].append(torch.nanmean(val_minibatch_losses).item())
         epoch_time = time.perf_counter() - epoch_start_time
-        epoch_times.append(epoch_time)
+        history["epoch_times"].append(epoch_time)
         tqdm.tqdm.write(
             f"Epoch {epoch + 1}: [{epoch_time:.2f}s] Train loss: {history['train']['loss'][epoch]} | Val loss: {history['val']['loss'][epoch]}")
 
         scheduler.step(val_loss)
 
-    state = {
-        "model_state_dict": model.state_dict(),
-        "CONFIG": CONFIG,
-        "model": model
-    }
-
-    folder_name = f"experiment_{model.__class__.__name__}_{datetime.datetime.now().strftime('%Y%m%d-%H%M%S')}"
-    os.mkdir(folder_name)
-    save_filename = f"{model.__class__.__name__}.pth"
-    torch.save(state, f"{folder_name}/{save_filename}")
-    pickle.dump(history, open(f"{folder_name}/history.pkl", "wb"))
-    np.save(f"{folder_name}/kl_history.npy", kl_history.cpu().numpy())
-
-    with open(f"{folder_name}/params.txt", "w") as f:
-        f.writelines(pprint.pformat(CONFIG))
-    with open(f"{folder_name}/time.txt", "w") as f:
-        f.writelines(str(epoch_times))
-
-    with open(f"{folder_name}/experimet_summary.txt", "a") as f:
-        f.writelines(folder_name + "\n")
-        f.writelines(pprint.pformat(CONFIG) + "\n")
-        f.write(f"Time : {np.array(epoch_times).mean() :.2f}\n")
-        f.write("\n\n")
-
-    print(f"Experiment saved to {folder_name}")
+    return save_training_attempt(model, CONFIG, history, np_extra={"kl_history": kl_history.cpu().numpy()})
 
 
 def evaluate(model_path):
@@ -336,7 +291,7 @@ def evaluate(model_path):
     eval_start = time.perf_counter()
     eval_times = []
     n_of_attempts_list = []
-    for i in tqdm.trange(1):
+    for i in tqdm.trange(TRIES):
         eval_attempt_start = time.perf_counter()
 
         latent_z = torch.randn(model.latent_dim, device=DEVICE)
@@ -344,7 +299,8 @@ def evaluate(model_path):
         # generated_tune, tries, n_of_attempts
         generated_tune = model.generate(latent_z, bos_idx, unk_idx)
         # generated_tune = #model.generate_tok_by_tok(latent_z, bos_idx, eos_idx) #
-        print(generated_tune)
+        with open(f"{tunes_out_folder}/tune_{i}.abc", "w") as out:
+            out.writelines(generated_tune)
 
     #     eval_times.append(time.perf_counter() - eval_attempt_start)
     #     with open(f"{tunes_out_folder}/tune_{i}_correct_attempts_{n_of_attempts}.abc", "w") as out:
@@ -379,25 +335,31 @@ def evaluate(model_path):
 DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 CONFIG = OrderedDict([
-    ("path_to_abc", "../data_processed/abc_parsed_cleanup2.abc"),
+    ("path_to_abc", "../data_processed/abc_parsed_cleanup5.abc"),
     ("batch_size", 64),
-    ("lr", 0.01),
-    ("embedding_size", 32),
-    ("latent_vector_size", 256),
-    ("encoder_decoder_hidden_size", 256),
+    ("lr", 0.003),
+    ("embedding_size", 16),
+    ("latent_vector_size", 64),
+    ("encoder_decoder_hidden_size", 128),
     ("encoder_decoder_num_layers", 2),
-    ("dropout_prob", 0.3),
-    ("epochs", 10),
-    ("cut_or_filter", "filter"),
-    ("max_len", 700)
+    ("dropout_prob", 0.0),
+    ("epochs", 50),
+    ("cut_or_filter", "cut"),
+    ("min_len", 10),
+    ("max_len", 30)
 ])
 
 if __name__ == "__main__":
     setup_matplotlib_style()
-    mode = "train"
+    # mode = "train"
     # mode = "eval"
-    model_path = "experiment_GRUSymetricalVAE_20220727-094750/GRUSymetricalVAE.pth"
+    mode = "both"
+    model_path = "experiment_RVAELatent_20220807-152527/RVAELatent.pth"
     if mode == "train":
         train()
     elif mode == "eval":
         evaluate(model_path)
+    elif mode == "both":
+        res = train()
+        evaluate(res)
+

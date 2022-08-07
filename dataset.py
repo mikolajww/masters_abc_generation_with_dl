@@ -85,7 +85,7 @@ class ABCDataset(Dataset):
 
 class ABCInMemoryDataset(Dataset):
 
-	def __init__(self, abc_file_dir, max_len, min_len=0, cut_or_filter="filter"):
+	def __init__(self, abc_file_dir, max_len, min_len=0, cut_or_filter="filter", min_freq=100):
 		self.tracks_str_array = read_file_to_str_array(abc_file_dir)
 		self.max_len = max_len
 		self.min_len = min_len
@@ -104,10 +104,9 @@ class ABCInMemoryDataset(Dataset):
 
 		specials = ["<PAD>", "<BOS>", "<EOS>", "<UNK>", ]
 
-		VOCAB_MIN_FREQ = 100
 		self.vocabulary = torchtext.vocab.build_vocab_from_iterator(
 			yield_tokens(self.tracks_str_array),
-			min_freq=VOCAB_MIN_FREQ,
+			min_freq=min_freq,
 			specials=specials,
 			special_first=True
 		)
@@ -198,7 +197,7 @@ def split_train_valid_test_dataloaders(
 
 	dataloader_kwargs = {
 		"batch_size": batch_size,
-		"shuffle": True,
+		"shuffle": False,
 		# "pin_memory": True,
 		"drop_last": True,
 		"collate_fn": collate_fn
