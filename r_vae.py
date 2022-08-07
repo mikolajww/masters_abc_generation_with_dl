@@ -229,7 +229,7 @@ def train():
             for i, (batch_X, batch_y, len_X, len_y) in enumerate(valid_data_loader):
                 predictions, len_predictions, mean, log_variance, z = model(batch_X, len_X)
                 targets = batch_y.long()
-                val_loss, (nll_loss, kl_div, kl_weight) = padded_kl_nll_loss(
+                val_loss, (nll_loss, kl_div, kl_weight) = loss_fn(
                     predictions, len_predictions, targets, len_y, mean, log_variance, optimizer_step
                 )
                 val_minibatch_losses[i] = val_loss
@@ -317,7 +317,7 @@ CONFIG = OrderedDict([
     ("lr", 0.001),
     ("embedding_size", 32),
     ("latent_vector_size", 256),
-    ("encoder_decoder_hidden_size", 256),
+    ("encoder_decoder_hidden_size", 512),
     ("encoder_decoder_num_layers", 3),
     ("dropout_prob", 0.5),
     ("epochs", 20),
@@ -328,9 +328,9 @@ CONFIG = OrderedDict([
 
 if __name__ == "__main__":
     setup_matplotlib_style()
-    mode = "train"
-    # mode = "eval"
-    model_path = "experiment_GRUSymetricalVAE_20220727-094750/GRUSymetricalVAE.pth"
+    # mode = "train"
+    mode = "eval"
+    model_path = "experiment_RVAE_20220806-160247/RVAE.pth"
     if mode == "train":
         train()
     elif mode == "eval":
