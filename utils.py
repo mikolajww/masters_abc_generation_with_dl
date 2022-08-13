@@ -1,6 +1,7 @@
 import datetime
 import os
 import pprint
+import random
 import re
 import sys
 from itertools import permutations
@@ -121,8 +122,18 @@ def save_training_attempt(model, CONFIG, history, picklable_extra=None, np_extra
 
     return f"{folder_name}/{save_filename}"
 
-def save_evaluation_attempt():
-    ...
+def setup_random_seeds(seed=123_567):
+    torch.random.manual_seed(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+
+def load_model_for_evaluation(model_path, device):
+    state = torch.load(model_path)
+    model = state["model"]
+    model.load_state_dict(state["model_state_dict"])
+    model.to(device)
+    model.eval()
+    return model
 
 
 def init_history():

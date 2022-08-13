@@ -11,8 +11,8 @@ class RecurrentEncoder(nn.Module):
             input_size: int,
             n_layers: int,
             hidden_dim: int,
+            bidirectional: bool,
             rnn_type: str = "GRU",
-            bidirectional: bool = True,
             **kwargs
     ) -> None:
         super().__init__()
@@ -21,6 +21,7 @@ class RecurrentEncoder(nn.Module):
             "GRU": torch.nn.GRU,
             "LSTM": torch.nn.LSTM
         }
+        self.bidirectional = bidirectional
         self.encoder = rnn[rnn_type](
             input_size=input_size,
             hidden_size=hidden_dim,
@@ -38,4 +39,6 @@ class RecurrentEncoder(nn.Module):
             # output = (batch_size, sequence_length, D * hidden_dim)
             # hidden = (D * num_layers, batch_size, hidden_dim)
         output, hidden = self.encoder(X)
+        # if self.bidirectional:
+        #     hidden = rearrange(hidden, "(2 n) b h -> n b (2 h)")
         return output, hidden

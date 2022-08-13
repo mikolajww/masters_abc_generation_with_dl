@@ -8,7 +8,6 @@ import torch
 import torch.nn.functional as F
 import tqdm
 from einops import rearrange, repeat
-from torch import nn
 from torch.nn.utils.rnn import pad_sequence, pack_padded_sequence, pad_packed_sequence
 
 from dataset import ABCInMemoryDataset, split_train_valid_test_dataloaders
@@ -16,11 +15,9 @@ from models.RecurrentEncoder import RecurrentEncoder
 from models.VAEMuLogVar import VAEMuLogVar
 from losses import padded_kl_nll_loss
 from utils import setup_matplotlib_style, plot_training_history_from_pickle, save_training_attempt, init_history, \
-    pad_collate
+    pad_collate, setup_random_seeds
 
-#### !!!!!
-## TODO
-#   THIS ONE USES THE CONCAT OF Z TO X
+
 class RVAE(torch.nn.Module):
     def __init__(
             self,
@@ -29,8 +26,7 @@ class RVAE(torch.nn.Module):
             enc_dec_hidden,
             enc_dec_nlayers,
             latent_dim,
-            dropout_prob,
-            bidirectional_encoder=False
+            dropout_prob
     ):
         super(RVAE, self).__init__()
         self.vocab = vocab
@@ -50,23 +46,21 @@ class RVAE(torch.nn.Module):
             hidden_dim=self.enc_dec_hidden,
             n_layers=self.enc_dec_nlayers,
             rnn_type="GRU",
-            bidirectional=bidirectional_encoder
+            bidirectional=False
         )
 
-        self.bidi_multiplier = 2 if bidirectional_encoder else 1
-
         self.mulogvar = VAEMuLogVar(
-            in_features=self.bidi_multiplier * self.enc_dec_hidden * self.enc_dec_nlayers,
+            in_features=self.enc_dec_hidden * self.enc_dec_nlayers,
             latent_dim=self.latent_dim
         )
 
-        self.latent_to_dec_hidden = nn.Sequential(
-            nn.Linear(self.latent_dim, self.enc_dec_hidden * self.enc_dec_nlayers),
-            nn.Tanh()
+        self.latent_to_dec_hidden = torch.nn.Linear(
+            in_features=self.latent_dim,
+            out_features=self.enc_dec_hidden * self.enc_dec_nlayers
         )
 
         self.decoder = torch.nn.GRU(
-            input_size=self.embedding_dim + self.latent_dim,
+            input_size=self.embedding_dim,
             hidden_size=self.enc_dec_hidden,
             num_layers=self.enc_dec_nlayers,
             batch_first=True
@@ -76,28 +70,20 @@ class RVAE(torch.nn.Module):
 
         self.dec_output_to_vocab = torch.nn.Linear(self.enc_dec_hidden, len(vocab))
 
-
     def forward(self, X, len_X):
         batch_size, padded_sequence_len = X.size()
         X = self.embedding(X) # X = (batch size, max_len, embedding_size)
         _, hidden = self.encoder(X, len_X, DEVICE)  # hidden = (num_layers, batch_size, hidden_size)
 
-        hidden = rearrange(
-            hidden, "(bidi l) b h -> b (l bidi h)",
-            bidi=self.bidi_multiplier
-        )
-
         z, mu, logvar = self.mulogvar(hidden, DEVICE)
 
         latent_hidden = self.latent_to_dec_hidden(z)
         latent_hidden = rearrange(
-            latent_hidden, "b (l bidi h) -> (bidi l) b h",
-            b=batch_size, h=self.enc_dec_hidden, bidi=self.bidi_multiplier
+            latent_hidden, "b (l h) -> l b h ",
+            b=batch_size, h=self.enc_dec_hidden
         )
-        decoder_z = repeat(z, "b z -> b repeat z", repeat=X.size(1))
-        decoder_input = torch.cat([X, decoder_z], dim=-1)
 
-        packed_X = pack_padded_sequence(decoder_input, len_X, batch_first=True, enforce_sorted=False).to(DEVICE)
+        packed_X = pack_padded_sequence(X, len_X, batch_first=True, enforce_sorted=False).to(DEVICE)
 
         output, _ = self.decoder(packed_X, latent_hidden)
 
@@ -110,6 +96,35 @@ class RVAE(torch.nn.Module):
         out_X = F.log_softmax(out_X, dim=-1)
 
         return out_X, out_len_X, mu, logvar, z
+
+    def generate(self, latent_z, sos_idx, unk_idx):
+        # latent z should be of shape (batch_size, latent_size)
+
+        with torch.no_grad():
+            latent_hidden = self.latent_to_dec_hidden(latent_z)
+            latent_hidden = rearrange(
+                latent_hidden, "b (l h) -> l b h",
+                l=self.enc_dec_nlayers,
+                h=self.enc_dec_hidden
+            )
+            X = torch.zeros(CONFIG["max_len"], device=DEVICE).fill_(unk_idx).long()
+            X[0] = sos_idx
+            len_X = torch.tensor([len(X)]).long()
+            X = rearrange(X, "x -> 1 x")
+            X = self.embedding(X)
+            packed_X = pack_padded_sequence(X, len_X, batch_first=True, enforce_sorted=False).to(DEVICE)
+
+            output, _ = self.decoder(packed_X, latent_hidden)
+
+            # unpack
+            out_X, out_len_X = pad_packed_sequence(output, batch_first=True)
+
+            out_X = self.dec_output_to_vocab(out_X)
+            # Log softmax returns large negative numbers for low probas and near-zero for high probas
+            # last dim is actual embeddings
+            out_X = F.log_softmax(out_X, dim=-1)
+            tune = self.vocab.lookup_tokens(torch.argmax(out_X, dim=-1).cpu().squeeze().tolist())
+            return "".join(tune)
 
     def generate_tok_by_tok(self, latent_z, bos_idx, eos_idx):
 
@@ -126,11 +141,8 @@ class RVAE(torch.nn.Module):
         i = 0
         while X.squeeze().item() != eos_idx:
             with torch.no_grad():
-                # X = rearrange(X, "x -> 1 x")
+                X = rearrange(X, "x -> 1 x")
                 X = self.embedding(X)
-                X = torch.cat([X, latent_z], dim=-1)
-                X = rearrange(X, "e x -> 1 e x")
-                # X = torch.cat([X, latent_z], dim=-1)
 
                 output, latent_hidden = self.decoder(X, latent_hidden)
 
@@ -238,6 +250,7 @@ def train():
 def evaluate(model_path):
     print(f"Loading model {model_path}")
     state = torch.load(model_path)
+    CONFIG = state["CONFIG"]
     model = state["model"]
     model.load_state_dict(state["model_state_dict"])
     model.to(DEVICE)
@@ -264,7 +277,7 @@ def evaluate(model_path):
         latent_z = torch.randn(model.latent_dim, device=DEVICE)
         latent_z = rearrange(latent_z, "z -> 1 z")
         # generated_tune, tries, n_of_attempts
-        #generated_tune = model.generate(latent_z, bos_idx, unk_idx)
+        # generated_tune = model.generate(latent_z, bos_idx, unk_idx)
         generated_tune = model.generate_tok_by_tok(latent_z, bos_idx, eos_idx)
         print(generated_tune)
 
@@ -297,52 +310,6 @@ def evaluate(model_path):
     #
     # print(eval_summary_str)
 
-def interpolate(model, tune_1, tune_2):
-    dataset = ABCInMemoryDataset(
-        CONFIG["path_to_abc"],
-        min_len=CONFIG["min_len"],
-        max_len=CONFIG["max_len"],
-        cut_or_filter=CONFIG["cut_or_filter"]
-    )
-
-    print(f"Loading model {model_path}")
-    state = torch.load(model_path)
-    model = state["model"]
-    model.load_state_dict(state["model_state_dict"])
-    model.to(DEVICE)
-    model.eval()
-
-    tune_1 = """
-M:6/8
-L:1/8
-K:Bm
-|:FBBBAB|FBBB2A|FBBBAB|c2ccec|
-FBBBcd|cBAABA|FBBBcd|cBA~B3:|
-|:~g3faf|efgfdB|efgfed|cBAB2f|
-~g3faf|efedBA|B3Bcd|cBBB2f:|"""
-
-    tune_2 = """
-M:4/4
-L:1/8
-K:G
-|G3BAGEG|DGBGDGBd|e2gedBAB|G2AGEGDF|
-G2BGABde|g2egdedB|GABGABGE|D2GABGG2:|
-|:g3ed2ga|bgagegd2|e3gedBA|GBAGE2D2|
-g3ag2ed|egdgegd2|eaagb2ag|egdBAGEF:|
-    """
-    tune_1 = torch.tensor(dataset.text_to_int_encoder(list(tune_1)), device=DEVICE)
-    tune_2 = torch.tensor(dataset.text_to_int_encoder(list(tune_2)), device=DEVICE)
-
-    #make into batch of 1
-    tune_1 = rearrange(tune_1, "t -> 1 t")
-    tune_2 = rearrange(tune_2, "t -> 1 t")
-
-    # X = self.embedding(X)  # X = (batch size, max_len, embedding_size)
-    # _, hidden = self.encoder(X, len_X, DEVICE)
-
-    latent_1 = model.
-
-
 DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 CONFIG = OrderedDict([
@@ -362,16 +329,34 @@ CONFIG = OrderedDict([
 
 if __name__ == "__main__":
     setup_matplotlib_style()
+    setup_random_seeds()
     # mode = "train"
     mode = "eval"
-    model_path = "experiment_RVAE_20220808-171407/RVAE.pth"
+    model_path = "experiment_RVAE_20220808-153800/RVAE.pth"
     if mode == "train":
         train()
     elif mode == "eval":
+
         evaluate(model_path)
 
+
 """
-
-
-
+X:6
+M:6/8
+L:1/8
+K:Bm
+|:FBBBAB|FBBB2A|FBBBAB|c2ccec|
+FBBBcd|cBAABA|FBBBcd|cBA~B3:|
+|:~g3faf|efgfdB|efgfed|cBAB2f|
+~g3faf|efedBA|B3Bcd|cBBB2f:|
+"""
+"""
+X:7
+M:4/4
+L:1/8
+K:G
+|G3BAGEG|DGBGDGBd|e2gedBAB|G2AGEGDF|
+G2BGABde|g2egdedB|GABGABGE|D2GABGG2:|
+|:g3ed2ga|bgagegd2|e3gedBA|GBAGE2D2|
+g3ag2ed|egdgegd2|eaagb2ag|egdBAGEF:|
 """

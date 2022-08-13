@@ -63,10 +63,9 @@ def padded_kl_nll_loss(predictions, len_predictions,
         nll = F.nll_loss(
             predictions[i][:len_predictions[i]],
             targets[i][:len_targets[i]],
-            reduction="sum",
+            reduction="mean",
             ignore_index=0
         )
-        nll = nll / len_predictions[i].cuda()
         nll_loss += nll
 
     # batch_loss = batch_loss / predictions.size(0)
