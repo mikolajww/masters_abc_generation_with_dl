@@ -61,26 +61,26 @@ class RVAE(torch.nn.Module):
         )
 
         self.latent_to_dec_hidden = nn.Sequential(
-            nn.Linear(self.latent_dim, self.enc_dec_hidden * self.enc_dec_nlayers),
+            nn.Linear(self.latent_dim, self.enc_dec_hidden * self.enc_dec_nlayers * self.bidi_multiplier),
             nn.Tanh()
         )
 
         self.decoder = torch.nn.GRU(
             input_size=self.embedding_dim + self.latent_dim,
-            hidden_size=self.enc_dec_hidden,
+            hidden_size=self.bidi_multiplier * self.enc_dec_hidden,
             num_layers=self.enc_dec_nlayers,
             batch_first=True
         )
 
         self.emb_dropout = torch.nn.Dropout(p=self.dropout_prob)
 
-        self.dec_output_to_vocab = torch.nn.Linear(self.enc_dec_hidden, len(vocab))
+        self.dec_output_to_vocab = torch.nn.Linear(self.bidi_multiplier * self.enc_dec_hidden, len(vocab))
 
 
     def forward(self, X, len_X):
         batch_size, padded_sequence_len = X.size()
         X = self.embedding(X) # X = (batch size, max_len, embedding_size)
-        _, hidden = self.encoder(X, len_X, DEVICE)  # hidden = (num_layers, batch_size, hidden_size)
+        _, hidden = self.encoder(X, len_X, DEVICE)  # hidden = ( bidi * num_layers, batch_size, hidden_size)
 
         hidden = rearrange(
             hidden, "(bidi l) b h -> b (l bidi h)",
@@ -89,9 +89,9 @@ class RVAE(torch.nn.Module):
 
         z, mu, logvar = self.mulogvar(hidden, DEVICE)
 
-        latent_hidden = self.latent_to_dec_hidden(z)
+        latent_hidden = self.latent_to_dec_hidden(z) #
         latent_hidden = rearrange(
-            latent_hidden, "b (l bidi h) -> (bidi l) b h",
+            latent_hidden, "b (l bidi h) -> l b (bidi h)",
             b=batch_size, h=self.enc_dec_hidden, bidi=self.bidi_multiplier
         )
         decoder_z = repeat(z, "b z -> b repeat z", repeat=X.size(1))
@@ -140,6 +140,9 @@ class RVAE(torch.nn.Module):
                 probas = F.softmax(out_X, dim=-1).cpu().squeeze().numpy()
 
                 chosen_index = np.random.choice(len(out_X.squeeze()), p=probas)
+
+                # chosen_index = np.argmax(probas)
+
                 X = torch.tensor([chosen_index], device=DEVICE).long()
                 # X = torch.argmax(out_X, dim=-1)
 
@@ -174,7 +177,8 @@ def train():
         enc_dec_hidden=CONFIG["encoder_decoder_hidden_size"],
         enc_dec_nlayers=CONFIG["encoder_decoder_num_layers"],
         latent_dim=CONFIG["latent_vector_size"],
-        dropout_prob=CONFIG["dropout_prob"]
+        dropout_prob=CONFIG["dropout_prob"],
+        bidirectional_encoder=CONFIG["bidirectional_encoder"]
     ).to(DEVICE)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
@@ -243,9 +247,7 @@ def evaluate(model_path):
     model.to(DEVICE)
     model.eval()
 
-    eos_tok = "<EOS>"
     bos_idx = model.vocab.lookup_indices(["<BOS>"])[0]
-    unk_idx = model.vocab.lookup_indices(["<UNK>"])[0]
     eos_idx = model.vocab.lookup_indices(["<EOS>"])[0]
 
     TRIES = 500
@@ -297,7 +299,7 @@ def evaluate(model_path):
     #
     # print(eval_summary_str)
 
-def interpolate(model, tune_1, tune_2):
+def interpolate(model, tune_1 = None, tune_2 = None):
     dataset = ABCInMemoryDataset(
         CONFIG["path_to_abc"],
         min_len=CONFIG["min_len"],
@@ -315,39 +317,62 @@ def interpolate(model, tune_1, tune_2):
     tune_1 = """
 M:6/8
 L:1/8
-K:Bm
-|:FBBBAB|FBBB2A|FBBBAB|c2ccec|
-FBBBcd|cBAABA|FBBBcd|cBA~B3:|
-|:~g3faf|efgfdB|efgfed|cBAB2f|
-~g3faf|efedBA|B3Bcd|cBBB2f:|"""
+K:B
+|CBBC|ABBA|
+"""
 
     tune_2 = """
 M:4/4
 L:1/8
 K:G
-|G3BAGEG|DGBGDGBd|e2gedBAB|G2AGEGDF|
-G2BGABde|g2egdedB|GABGABGE|D2GABGG2:|
-|:g3ed2ga|bgagegd2|e3gedBA|GBAGE2D2|
-g3ag2ed|egdgegd2|eaagb2ag|egdBAGEF:|
+|CGDA|AGAB|
     """
-    tune_1 = torch.tensor(dataset.text_to_int_encoder(list(tune_1)), device=DEVICE)
-    tune_2 = torch.tensor(dataset.text_to_int_encoder(list(tune_2)), device=DEVICE)
+    tune_1 = torch.tensor(dataset.text_to_int_encoder(list(tune_1)), device=DEVICE, requires_grad=False)
+    tune_2 = torch.tensor(dataset.text_to_int_encoder(list(tune_2)), device=DEVICE, requires_grad=False)
 
-    #make into batch of 1
-    tune_1 = rearrange(tune_1, "t -> 1 t")
-    tune_2 = rearrange(tune_2, "t -> 1 t")
+    with torch.no_grad():
+        #make into batch of 1
+        tune_1 = rearrange(tune_1, "t -> 1 t")
+        tune_2 = rearrange(tune_2, "t -> 1 t")
+        len_tune_1 = [len(t) for t in tune_1]
+        len_tune_2 = [len(t) for t in tune_2]
+        tune_1 = model.embedding(tune_1)
 
-    # X = self.embedding(X)  # X = (batch size, max_len, embedding_size)
-    # _, hidden = self.encoder(X, len_X, DEVICE)
+        _, hidden = model.encoder(tune_1, len_tune_1, DEVICE)
 
-    latent_1 = model.
+        hidden = rearrange(
+            hidden, "(bidi l) b h -> b (l bidi h)",
+            bidi=model.bidi_multiplier
+        )
+
+        latent_1, _, _ = model.mulogvar(hidden, DEVICE)
+
+        tune_2 = model.embedding(tune_2)
+
+        _, hidden = model.encoder(tune_2, len_tune_2, DEVICE)
+
+        hidden = rearrange(
+            hidden, "(bidi l) b h -> b (l bidi h)",
+            bidi=model.bidi_multiplier
+        )
+
+        bos_idx = model.vocab.lookup_indices(["<BOS>"])[0]
+        eos_idx = model.vocab.lookup_indices(["<EOS>"])[0]
+
+        latent_2, _, _ = model.mulogvar(hidden, DEVICE)
+        n_intermediate = 5
+        interpolated = np.linspace(latent_1.cpu().numpy(), latent_2.cpu().numpy(), n_intermediate + 2)
+        for z in interpolated:
+            generated_tune = model.generate_tok_by_tok(torch.from_numpy(z).to(DEVICE), bos_idx, eos_idx)
+            print(generated_tune)
+
 
 
 DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 CONFIG = OrderedDict([
     ("path_to_abc", "../data_processed/abc_parsed_cleanup5.abc"),
-    ("batch_size", 64),
+    ("batch_size", 40),
     ("lr", 0.001),
     ("embedding_size", 32),
     ("latent_vector_size", 256),
@@ -357,21 +382,18 @@ CONFIG = OrderedDict([
     ("epochs", 20),
     ("cut_or_filter", "cut"),
     ("min_len", 30),
-    ("max_len", 700)
+    ("max_len", 400),
+    ("bidirectional_encoder", False)
 ])
 
 if __name__ == "__main__":
     setup_matplotlib_style()
-    # mode = "train"
-    mode = "eval"
+    mode = "train"
+    # mode = "eval"
     model_path = "experiment_RVAE_20220808-171407/RVAE.pth"
     if mode == "train":
         train()
     elif mode == "eval":
         evaluate(model_path)
+        # interpolate(model_path)
 
-"""
-
-
-
-"""

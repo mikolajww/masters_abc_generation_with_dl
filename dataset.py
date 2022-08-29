@@ -219,7 +219,7 @@ def split_train_valid_test_dataloaders(
 DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 if __name__ == "__main__":
-	path_to_abc = '../data_processed/abc_parsed_cleanup4.abc'
+	path_to_abc = '../data_processed/abc_parsed_cleanup5.abc'
 	start_time = time.perf_counter()
 	dataset = ABCInMemoryDataset(path_to_abc, min_len=0, max_len=100000, cut_or_filter="filter")
 	print(f"Took {time.perf_counter() - start_time} to load the dataset")

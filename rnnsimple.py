@@ -55,16 +55,20 @@ class RNNSimpleGenerator(nn.Module):
         self.embed = nn.Embedding(len(self.vocab), embed_dim)
 
     def forward(self, X, len_X, initial_hidden=None):
-        if self.one_hot:
+        try:
+            if self.one_hot:
+                X = F.one_hot(X.long(), num_classes=len(self.vocab)).float()
+            else:
+                X = self.embed(X)
+        except AttributeError as err:
+            # backwards compatibility
             X = F.one_hot(X.long(), num_classes=len(self.vocab)).float()
-        else:
-            X = self.embed(X)
         X = pack_padded_sequence(X, len_X, batch_first=True, enforce_sorted=False).to(DEVICE)
-        X, h = self.lstm(X, initial_hidden)
+        X, (h, c) = self.lstm(X, initial_hidden)
         X, len_X = pad_packed_sequence(X, batch_first=True)
         X = self.dropout(X)
         X = self.fc(X)
-        return X, len_X, h
+        return X, len_X, (h, c)
 
     def init_hidden(self, batch_size, device):
         h = torch.zeros(size=(self.n_layers, batch_size, self.hidden_size)).to(device)
@@ -161,8 +165,7 @@ def try_generate(model, eos):
             generated_tokens = [start_character]
             attempt += 1
 
-            h = model.init_hidden(batch_size=1, device=DEVICE)
-            c = model.init_hidden(batch_size=1, device=DEVICE)
+            h, c = model.init_hidden(batch_size=1, device=DEVICE)
             generated_tok = None
             while generated_tok != eos:
                 x = torch.tensor(char2int([generated_tokens[-1]])).expand(1, 1)  # 1 element batch
@@ -236,7 +239,6 @@ def evaluate(model_path):
         f.writelines(pprint.pformat(CONFIG))
         f.write("\n")
         f.writelines(str(model))
-        f.writelines(model.n)
         f.writelines(eval_summary_str)
 
     print(eval_summary_str)
@@ -258,14 +260,12 @@ CONFIG = OrderedDict([
 
 if __name__ == "__main__":
     setup_matplotlib_style()
-    mode = "train"
-    # mode = "eval"
-    model_path = "experiment_20220721-150209/RNNSimpleGenerator.pth"
+    # mode = "train"
+    mode = "eval"
+    model_path = "experiment_20220716-025432/RNNSimpleGenerator__lr_0.001__epochs_10__cut_or_filter_filter__dropout_prob_0.4__batch_size_128__n_recurrent_layers_1__max_len_500__hidden_size_256__20220716-025432.pth"
+    # model_path = "experiment_20220718-191703/RNNSimpleGenerator.pth"
     if mode == "train":
         train()
     elif mode == "eval":
+        plot_training_history_from_pickle("experiment_20220718-191703", "history.pkl")
         evaluate(model_path)
-    else:
-        hist = pickle.load(open("experiment_20220715-161305_no_L_metatag/history.pkl", "rb"))
-
-        print(hist)

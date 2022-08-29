@@ -1,7 +1,10 @@
 import datetime
+import pprint
 import re
 from pathlib import Path
 from collections import Counter
+
+import matplotlib.pyplot as plt
 
 import utils
 
@@ -28,6 +31,7 @@ n_files = {".abc": 0, ".txt": 0}
 n_abc_songs = 0
 missing_m, missing_l, invalid = 0, 0, 0
 
+counter = Counter()
 
 def try_open(path, encoding, songs):
     global n_abc_songs, missing_m, missing_l, invalid
@@ -54,7 +58,10 @@ def try_open(path, encoding, songs):
                 cleaned_line = re.sub("([Pp]hrygian)|(Phr)", "phr", cleaned_line, re.IGNORECASE)
                 cleaned_line = re.sub("([Ll]ydian)|(Lyd)", "lyd", cleaned_line, re.IGNORECASE)
                 cleaned_line = re.sub("([Ll]ocrian)|(Loc)", "loc", cleaned_line, re.IGNORECASE)
-                if cleaned_line.strip():
+                if cleaned_line.strip(): # line is not empty or whitespace
+                    if m := re.match("(^K:.*$)|(^M:.*$)|(^L:.*$)", cleaned_line):
+                        cl_str = m.string.replace(" ", "").replace("\n", "").lower()
+                        counter[cl_str] += 1
                     cleaned_tune += cleaned_line.replace(" ", "") + "\n"
             if not cleaned_tune:
                 # empty song - nothing was left
@@ -87,11 +94,44 @@ for ext in [".abc", ".txt"]:
             except Exception as exc:
                 print(f"Unexpected exception {exc.__class__} : {exc}")
                 continue
-        print(f"{i} - {path}")
+        # print(f"{i} - {path}")
         n_files[ext] += 1
 
 with open(target_file, "w", encoding="utf-8") as f:
     f.writelines(songs)
+
+with open(target_file + "_stats.txt", "w") as f:
+    f.writelines(pprint.pformat(counter))
+    f.writelines(f"\n{missing_m=},{missing_l=}, {invalid=}")
+    f.writelines(f"\n{n_abc_songs=}, {n_files=}")
+
+key_counter = Counter()
+length_counter = Counter()
+meter_counter = Counter()
+for k, v in counter.items():
+    if k.startswith("k"):
+        k = re.sub("maj", "", k, re.IGNORECASE)
+        k = re.sub("min", "m", k, re.IGNORECASE)
+        k = re.sub("k:", "", k, re.IGNORECASE)
+        key_counter[k] += v
+    if k.startswith("l"):
+        k = re.sub("l:", "", k, re.IGNORECASE)
+        length_counter[k] += v
+    if k.startswith("m"):
+        k = re.sub("m:", "", k, re.IGNORECASE)
+        meter_counter[k] += v
+
+# C = 4/4    C| = 2/2
+meter_counter["4/4"] += meter_counter["c"]
+del meter_counter["c"]
+
+meter_counter["2/2"] += meter_counter["c|"]
+del meter_counter["c|"]
+
+utils.setup_matplotlib_style()
+
+plt.hist()
+
 
 print(f"Found {sum(n_files.values())} ({n_files=}) files ")
 print(f"Found {n_abc_songs} total songs")

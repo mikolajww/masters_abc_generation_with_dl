@@ -62,13 +62,15 @@ def is_valid_abc(tune):
 # base_folder.joinpath("history.pkl")
 def plot_training_history_from_pickle(base_folder, pkl_name):
     hist = pickle.load(open(f"{base_folder}/{pkl_name}", "rb"))
-    plt.plot(np.arange(1, len(hist["train"]["loss"]) + 1), hist["train"]["loss"], label="Training loss")
-    plt.plot(np.arange(1, len(hist["val"]["loss"]) + 1), hist["val"]["loss"], label="Validation loss")
+    hist_y_train = np.array(hist["train"]["loss"]) / 50
+    hist_y_val = np.array(hist["val"]["loss"]) / 50
+    plt.plot(np.arange(1, len(hist["train"]["loss"]) + 1), hist_y_train, label="Training loss")
+    plt.plot(np.arange(1, len(hist["val"]["loss"]) + 1), hist_y_val, label="Validation loss")
     plt.legend()
     plt.title(
-        f"Minimum traning loss: {np.array(hist['train']['loss']).min() :.5f}\nMinimum validation loss: {np.array(hist['val']['loss']).min():.5f}")
+        f"Minimum traning loss: {hist_y_train.min() :.5f}\nMinimum validation loss: {hist_y_val.min():.5f}")
     plt.xlabel("Epoch")
-    plt.ylabel("Loss (Crossentropy)")
+    plt.ylabel("Loss")
     plt.savefig(f"{base_folder}/training_val_losses.png")
     plt.show()
 
@@ -122,10 +124,12 @@ def save_training_attempt(model, CONFIG, history, picklable_extra=None, np_extra
 
     return f"{folder_name}/{save_filename}"
 
+
 def setup_random_seeds(seed=123_567):
     torch.random.manual_seed(seed)
     np.random.seed(seed)
     random.seed(seed)
+
 
 def load_model_for_evaluation(model_path, device):
     state = torch.load(model_path)
