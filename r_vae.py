@@ -1,3 +1,5 @@
+import pickle
+import pprint
 import time
 from collections import OrderedDict
 from functools import partial
@@ -11,6 +13,7 @@ from einops import rearrange, repeat
 from torch import nn
 from torch.nn.utils.rnn import pad_sequence, pack_padded_sequence, pad_packed_sequence
 
+import utils
 from dataset import ABCInMemoryDataset, split_train_valid_test_dataloaders
 from models.RecurrentEncoder import RecurrentEncoder
 from models.VAEMuLogVar import VAEMuLogVar
@@ -111,47 +114,51 @@ class RVAE(torch.nn.Module):
 
         return out_X, out_len_X, mu, logvar, z
 
-    def generate_tok_by_tok(self, latent_z, bos_idx, eos_idx):
+    def generate_autoregressively(self, latent_z, bos_idx, eos_idx):
+        attempt = 0
+        tries = []
+        while True:
+            attempt += 1
+            latent_hidden = self.latent_to_dec_hidden(latent_z)
+            latent_hidden = rearrange(
+                latent_hidden, "b (l bidi h) -> l b (bidi h)",
+                l=self.enc_dec_nlayers,
+                h=self.enc_dec_hidden,
+                bidi=self.bidi_multiplier
+            )
 
-        latent_hidden = self.latent_to_dec_hidden(latent_z)
-        latent_hidden = rearrange(
-            latent_hidden, "b (l h) -> l b h",
-            l=self.enc_dec_nlayers,
-            h=self.enc_dec_hidden
-        )
+            generated_tune = []
+            X = torch.tensor([bos_idx], device=DEVICE).long()
 
-        generated_tune = []
-        X = torch.tensor([bos_idx], device=DEVICE).long()
+            while X.squeeze().item() != eos_idx:
+                with torch.no_grad():
+                    # X = rearrange(X, "x -> 1 x")
+                    X = self.embedding(X)
+                    X = torch.cat([X, latent_z], dim=-1)
+                    X = rearrange(X, "e x -> 1 e x")
+                    # X = torch.cat([X, latent_z], dim=-1)
 
-        i = 0
-        while X.squeeze().item() != eos_idx:
-            with torch.no_grad():
-                # X = rearrange(X, "x -> 1 x")
-                X = self.embedding(X)
-                X = torch.cat([X, latent_z], dim=-1)
-                X = rearrange(X, "e x -> 1 e x")
-                # X = torch.cat([X, latent_z], dim=-1)
+                    output, latent_hidden = self.decoder(X, latent_hidden)
 
-                output, latent_hidden = self.decoder(X, latent_hidden)
+                    out_X = self.dec_output_to_vocab(output)
+                    # Log softmax returns large negative numbers for low probas and near-zero for high probas
+                    # last dim is actual embeddings
+                    probas = F.softmax(out_X, dim=-1).cpu().squeeze().numpy()
 
-                out_X = self.dec_output_to_vocab(output)
-                # Log softmax returns large negative numbers for low probas and near-zero for high probas
-                # last dim is actual embeddings
-                probas = F.softmax(out_X, dim=-1).cpu().squeeze().numpy()
+                    chosen_index = np.random.choice(len(out_X.squeeze()), p=probas)
 
-                chosen_index = np.random.choice(len(out_X.squeeze()), p=probas)
+                    # chosen_index = np.argmax(probas)
 
-                # chosen_index = np.argmax(probas)
+                    X = torch.tensor([chosen_index], device=DEVICE).long()
+                    # X = torch.argmax(out_X, dim=-1)
 
-                X = torch.tensor([chosen_index], device=DEVICE).long()
-                # X = torch.argmax(out_X, dim=-1)
-
-                generated_tune.extend(self.vocab.lookup_tokens([chosen_index]))
-                i += 1
-                if i >= 1000:
-                    return "".join(generated_tune)
-
-        return "".join(generated_tune).replace("<EOS>", "")
+                    generated_tune.extend(self.vocab.lookup_tokens([chosen_index]))
+            tune = "".join(generated_tune).replace("<EOS>", "").replace("<BOS>","").strip()
+            if utils.is_valid_abc(tune):
+                break
+            else:
+                tries.append(tune)
+        return tune, tries, attempt
 
 
 def train():
@@ -260,44 +267,40 @@ def evaluate(model_path):
     eval_start = time.perf_counter()
     eval_times = []
     n_of_attempts_list = []
-    for i in tqdm.trange(1):
+    for i in tqdm.trange(TRIES):
         eval_attempt_start = time.perf_counter()
 
         latent_z = torch.randn(model.latent_dim, device=DEVICE)
         latent_z = rearrange(latent_z, "z -> 1 z")
-        # generated_tune, tries, n_of_attempts
-        #generated_tune = model.generate(latent_z, bos_idx, unk_idx)
-        generated_tune = model.generate_tok_by_tok(latent_z, bos_idx, eos_idx)
-        print(generated_tune)
+        generated_tune, tries, n_of_attempts = model.generate_autoregressively(latent_z, bos_idx, eos_idx)
 
-    #     eval_times.append(time.perf_counter() - eval_attempt_start)
-    #     with open(f"{tunes_out_folder}/tune_{i}_correct_attempts_{n_of_attempts}.abc", "w") as out:
-    #         out.writelines(generated_tune)
-    #     with open(f"{tunes_out_folder}/tune_{i}_incorrect_attempts_{n_of_attempts}.abc", "w") as out:
-    #         out.writelines(tries)
-    #     n_of_attempts_list.append(n_of_attempts)
-    #
-    # eval_end = time.perf_counter()
-    #
-    # with open(f"{base_folder}/n_of_tries.txt", "w") as f:
-    #     f.writelines(str(n_of_attempts_list))
-    #
-    # with open(f"{base_folder}/eval_times.pkl", "wb") as f:
-    #     pickle.dump(eval_times, f)
-    #
-    # eval_times = np.array(eval_times)
-    #
+        eval_times.append(time.perf_counter() - eval_attempt_start)
+        with open(f"{tunes_out_folder}/tune_{i}_correct_attempts_{n_of_attempts}.abc", "w") as out:
+            out.writelines(generated_tune)
+        with open(f"{tunes_out_folder}/tune_{i}_incorrect_attempts_{n_of_attempts}.abc", "w") as out:
+            out.writelines(tries)
+        n_of_attempts_list.append(n_of_attempts)
+
+    eval_end = time.perf_counter()
+
+    with open(f"{base_folder}/n_of_tries.txt", "w") as f:
+        f.writelines(str(n_of_attempts_list))
+
+    with open(f"{base_folder}/eval_times.pkl", "wb") as f:
+        pickle.dump(eval_times, f)
+
+    eval_times = np.array(eval_times)
+
     plot_training_history_from_pickle(base_folder, "history.pkl")
 
-    #
-    # eval_summary_str = f"Took {eval_end - eval_start:.2f}s to evaluate. [min = {eval_times.min()}, avg = {eval_times.mean()}, max = {eval_times.max()}]"
-    # with open(f"{base_folder}/model_summary.txt", "w") as f:
-    #     f.writelines(pprint.pformat(CONFIG))
-    #     f.write("\n")
-    #     f.writelines(str(model))
-    #     f.writelines(eval_summary_str)
-    #
-    # print(eval_summary_str)
+    eval_summary_str = f"Took {eval_end - eval_start:.2f}s to evaluate. [min = {eval_times.min()}, avg = {eval_times.mean()}, max = {eval_times.max()}]"
+    with open(f"{base_folder}/model_summary.txt", "w") as f:
+        f.writelines(pprint.pformat(CONFIG))
+        f.write("\n")
+        f.writelines(str(model))
+        f.writelines(eval_summary_str)
+
+    print(eval_summary_str)
 
 def interpolate(model, tune_1 = None, tune_2 = None):
     dataset = ABCInMemoryDataset(
@@ -363,7 +366,7 @@ K:G
         n_intermediate = 5
         interpolated = np.linspace(latent_1.cpu().numpy(), latent_2.cpu().numpy(), n_intermediate + 2)
         for z in interpolated:
-            generated_tune = model.generate_tok_by_tok(torch.from_numpy(z).to(DEVICE), bos_idx, eos_idx)
+            generated_tune = model.generate_autoregressively(torch.from_numpy(z).to(DEVICE), bos_idx, eos_idx)
             print(generated_tune)
 
 
@@ -372,28 +375,28 @@ DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 CONFIG = OrderedDict([
     ("path_to_abc", "../data_processed/abc_parsed_cleanup5.abc"),
-    ("batch_size", 40),
+    ("batch_size", 64),
     ("lr", 0.001),
     ("embedding_size", 32),
-    ("latent_vector_size", 256),
-    ("encoder_decoder_hidden_size", 512),
-    ("encoder_decoder_num_layers", 3),
+    ("latent_vector_size", 128),
+    ("encoder_decoder_hidden_size", 256),
+    ("encoder_decoder_num_layers", 1),
     ("dropout_prob", 0.5),
-    ("epochs", 20),
+    ("epochs", 10),
     ("cut_or_filter", "cut"),
     ("min_len", 30),
     ("max_len", 400),
-    ("bidirectional_encoder", False)
+    ("bidirectional_encoder", True)
 ])
-
+# TODO TOMMOROW TEST THIS!!!!!!!
 if __name__ == "__main__":
     setup_matplotlib_style()
-    mode = "train"
-    # mode = "eval"
-    model_path = "experiment_RVAE_20220808-171407/RVAE.pth"
+    # mode = "train"
+    mode = "eval"
+    model_path = "experiment_RVAE_20220905-023919/RVAE.pth"
     if mode == "train":
         train()
     elif mode == "eval":
         evaluate(model_path)
-        # interpolate(model_path)
+        interpolate(model_path)
 

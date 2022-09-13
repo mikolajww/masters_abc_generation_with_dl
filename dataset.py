@@ -51,7 +51,7 @@ class ABCDataset(Dataset):
 
 		specials = ["<BOS>", "<EOS>", "<UNK>", "<PAD>"]
 
-		VOCAB_MIN_FREQ = 100
+		VOCAB_MIN_FREQ = 500
 		self.vocabulary = torchtext.vocab.build_vocab_from_iterator(
 			yield_tokens(self.tracks_str_array),
 			min_freq=VOCAB_MIN_FREQ,
@@ -171,15 +171,20 @@ def investigate_data(dataset):
 
 	setup_matplotlib_style()
 	plt.figure()
-	plt.title("Distribution of tune lengths in the dataset\n(token=character)")
+	plt.suptitle("Distribution of tune lengths in the dataset")
+	plt.title("(token=character)")
 	plt.ylabel("Number of tunes")
 	plt.xlabel("Number of tokens in a tune")
 	plt.hist(track_lengths, bins=np.arange(0, LEN_TRESH, step=50), edgecolor='black', linewidth=0.5)
 	plt.show()
 
-	sns.boxplot(x=track_lengths)
-	plt.ylim([0, 20000])
-	plt.show()
+	# 30 random tunes from the dataset
+	random_tune_idx = np.random.randint(0, len(dataset.tracks_str_array), size=100)
+	with open("random_tunes_from_dataset.abc", "w") as f:
+		for i, idx in enumerate(random_tune_idx):
+			f.write(f"X:{i+1}")
+			f.write(dataset.tracks_str_array[idx])
+			f.write("\n\n")
 
 def split_train_valid_test_dataloaders(
 		dataset,

@@ -50,7 +50,8 @@ class RVAELatent(nn.Module):
             hidden_dim=self.enc_dec_hidden,
             n_layers=self.enc_dec_nlayers,
             rnn_type="GRU",
-            dropout=dropout_prob
+            dropout=dropout_prob,
+            bidirectional=False
         )
 
         self.mulogvar = VAEMuLogVar(
@@ -297,8 +298,8 @@ def evaluate(model_path):
         latent_z = torch.randn(model.latent_dim, device=DEVICE)
         latent_z = rearrange(latent_z, "z -> 1 z")
         # generated_tune, tries, n_of_attempts
-        generated_tune = model.generate(latent_z, bos_idx, unk_idx)
-        # generated_tune = #model.generate_tok_by_tok(latent_z, bos_idx, eos_idx) #
+        # generated_tune = model.generate(latent_z, bos_idx, unk_idx)
+        generated_tune = model.generate_tok_by_tok(latent_z, bos_idx, eos_idx) #
         with open(f"{tunes_out_folder}/tune_{i}.abc", "w") as out:
             out.writelines(generated_tune)
 
@@ -352,8 +353,8 @@ CONFIG = OrderedDict([
 if __name__ == "__main__":
     setup_matplotlib_style()
     # mode = "train"
-    # mode = "eval"
-    mode = "both"
+    mode = "eval"
+    # mode = "both"
     model_path = "experiment_RVAELatent_20220807-152527/RVAELatent.pth"
     if mode == "train":
         train()

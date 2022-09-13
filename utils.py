@@ -28,14 +28,24 @@ for p in header_permutations:
 
 header_regex = "|".join(["(" + s + ")" for s in header_regex])
 header_regex = "(" + header_regex + ")"
-header_regex += tune
-valid_abc_pattern = re.compile(header_regex)
+valid_abc_pattern = re.compile(header_regex + tune)
+
+header_permutations_no_L = permutations([meter_pattern, key_pattern])
+
+header_regex_no_L = []
+for p in header_permutations_no_L:
+    header_regex_no_L.append("".join(p))
+
+header_regex_no_L = "|".join(["(" + s + ")" for s in header_regex_no_L])
+header_regex_no_L = "(" + header_regex_no_L + ")"
+
+valid_abc_pattern_no_L = re.compile(header_regex_no_L + tune)
 
 
 def setup_matplotlib_style():
     plt.style.use(['high-vis'])
     rc('figure', **{'dpi': 150, 'figsize': (12, 7)})
-    rc('font', **{'family': 'serif', 'serif': ['Computer Modern'], 'size': 15})
+    rc('font', **{'family': 'serif', 'serif': ['Computer Modern'], 'size': 20})
     rc('text', usetex=True)
     rc('legend', **{'fontsize': 18})
 
@@ -55,15 +65,17 @@ def get_sizeof(var, suffix='B'):
     return "%.1f %s%s" % (num, 'Yi', suffix)
 
 
-def is_valid_abc(tune):
+def is_valid_abc(tune, include_L = True):
+    if not include_L:
+        return bool(re.search(valid_abc_pattern_no_L, tune))
     return bool(re.search(valid_abc_pattern, tune))
 
 
 # base_folder.joinpath("history.pkl")
-def plot_training_history_from_pickle(base_folder, pkl_name):
+def plot_training_history_from_pickle(base_folder, pkl_name, scale_y = 1):
     hist = pickle.load(open(f"{base_folder}/{pkl_name}", "rb"))
-    hist_y_train = np.array(hist["train"]["loss"]) / 50
-    hist_y_val = np.array(hist["val"]["loss"]) / 50
+    hist_y_train = np.array(hist["train"]["loss"]) / scale_y
+    hist_y_val = np.array(hist["val"]["loss"]) / scale_y
     plt.plot(np.arange(1, len(hist["train"]["loss"]) + 1), hist_y_train, label="Training loss")
     plt.plot(np.arange(1, len(hist["val"]["loss"]) + 1), hist_y_val, label="Validation loss")
     plt.legend()
@@ -163,3 +175,4 @@ def pad_collate(batch, device, pad_idx):
 
     return x_pad, y_pad, len_x, len_y
 
+setup_random_seeds()

@@ -130,7 +130,35 @@ del meter_counter["c|"]
 
 utils.setup_matplotlib_style()
 
-plt.hist()
+# plt.figure()
+# keys = key_counter.most_common(10)
+# x_keys = [a[0].title() for a in keys]
+# y_keys = [a[1] for a in keys]
+# plt.suptitle("Most common key signatures in the dataset")
+# plt.bar(x_keys, y_keys, color='blue', width=1.0, edgecolor='black', linewidth=1.5)
+# plt.xlabel("Number of tunes")
+# plt.ylabel("Key signature")
+# plt.savefig(r"C:\Users\Mikolaj\Desktop\Magisterka\abc_music_generation_with_dl\key_signatures.png")
+#
+# plt.figure()
+# meters = meter_counter.most_common(10)
+# x_meters = [a[0].title() for a in meters]
+# y_meters = [a[1] for a in meters]
+# plt.suptitle("Most common time signatures in the dataset")
+# plt.bar(x_meters, y_meters, color='blue', width=1.0, edgecolor='black', linewidth=1.5)
+# plt.xlabel("Number of tunes")
+# plt.ylabel("Meter")
+# plt.savefig(r"C:\Users\Mikolaj\Desktop\Magisterka\abc_music_generation_with_dl\meter_signatures.png")
+#
+# plt.figure()
+# lengths = length_counter.most_common(5)
+# x_lengths = [a[0].title() for a in lengths]
+# y_lengths = [a[1] for a in lengths]
+# plt.suptitle("Most common base note lengths in the dataset")
+# plt.bar(x_lengths, y_lengths, color='blue', width=1.0, edgecolor='black', linewidth=1.5)
+# plt.xlabel("Number of tunes")
+# plt.ylabel("Base note length")
+# plt.savefig(r"C:\Users\Mikolaj\Desktop\Magisterka\abc_music_generation_with_dl\length_signatures.png")
 
 
 print(f"Found {sum(n_files.values())} ({n_files=}) files ")

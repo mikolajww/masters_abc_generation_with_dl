@@ -9,6 +9,7 @@ import numpy as np
 import torch
 import tqdm
 # os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:256"
+from prettytable import PrettyTable
 from torch import nn
 from torch.nn import functional as F
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence, pad_sequence
@@ -35,7 +36,7 @@ class RNNSimpleGenerator(nn.Module):
 
         self.vocab = vocab
         self.lstm = nn.LSTM(
-            input_size=input_features,
+            input_size=input_features if one_hot else embed_dim,
             hidden_size=hidden_size,
             num_layers=n_layers,
             bias=True,
@@ -89,7 +90,8 @@ def train():
         vocab=dataset.vocabulary,
         hidden_size=CONFIG["hidden_size"],
         n_layers=CONFIG["n_recurrent_layers"],
-        dropout_prob=CONFIG["dropout_prob"]
+        dropout_prob=CONFIG["dropout_prob"],
+        one_hot=CONFIG["one-hot"],
     ).to(DEVICE)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=CONFIG["lr"])
@@ -168,7 +170,7 @@ def try_generate(model, eos):
             h, c = model.init_hidden(batch_size=1, device=DEVICE)
             generated_tok = None
             while generated_tok != eos:
-                x = torch.tensor(char2int([generated_tokens[-1]])).expand(1, 1)  # 1 element batch
+                x = torch.tensor(char2int([generated_tokens[-1]])).expand(1, 1).to(DEVICE) # 1 element batch
                 if x.ndimension() == 1:
                     len_x = torch.tensor([len(x)]).long()
                 else:
@@ -185,7 +187,7 @@ def try_generate(model, eos):
                 generated_tok = int2char([generated_tok])[0]
                 generated_tokens.append(generated_tok)
             generated_tune = "".join(generated_tokens).replace(start_character, "").replace(eos, "")
-            if is_valid_abc(generated_tune):
+            if is_valid_abc(generated_tune, include_L=True):
                 break
             else:
                 tries.append(generated_tune)
@@ -247,25 +249,40 @@ def evaluate(model_path):
 DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 CONFIG = OrderedDict([
-    ("path_to_abc", "../data_processed/abc_parsed_cleanup2.abc"),
+    ("path_to_abc", "../data_processed/abc_parsed_cleanup5.abc"),
     ("batch_size", 64),
     ("lr", 0.002),
     ("hidden_size", 512),
     ("n_recurrent_layers", 3),
-    ("dropout_prob", 0.5),
-    ("epochs", 20),
+    ("dropout_prob", 0.3),
+    ("epochs", 10),
     ("cut_or_filter", "cut"),
-    ("max_len", 700)
+    ("min_len", 30),
+    ("max_len", 400),
+    ("one-hot", False)
 ])
 
 if __name__ == "__main__":
     setup_matplotlib_style()
-    # mode = "train"
-    mode = "eval"
-    model_path = "experiment_20220716-025432/RNNSimpleGenerator__lr_0.001__epochs_10__cut_or_filter_filter__dropout_prob_0.4__batch_size_128__n_recurrent_layers_1__max_len_500__hidden_size_256__20220716-025432.pth"
-    # model_path = "experiment_20220718-191703/RNNSimpleGenerator.pth"
+    mode = "traina"
+    # mode = "eval"
+    # model_path = "experiment_20220716-025432/RNNSimpleGenerator__lr_0.001__epochs_10__cut_or_filter_filter__dropout_prob_0.4__batch_size_128__n_recurrent_layers_1__max_len_500__hidden_size_256__20220716-025432.pth"
+    model_path = "experiment_RNNSimpleGenerator_20220831-045516/RNNSimpleGenerator.pth"
     if mode == "train":
         train()
     elif mode == "eval":
-        plot_training_history_from_pickle("experiment_20220718-191703", "history.pkl")
+        plot_training_history_from_pickle("experiment_RNNSimpleGenerator_20220831-045516", "history.pkl")
         evaluate(model_path)
+    else:
+        model_path = r"experiment_20220720-071201/RNNSimpleGenerator.pth"
+        model = torch.load(model_path)["model"]
+        total_params = 0
+        table = PrettyTable(["Modules", "Parameters"])
+        for name, param in model.named_parameters():
+            if not param.requires_grad: continue
+            param_count = param.numel()
+            table.add_row([name, param_count])
+            total_params += param_count
+        print(model_path)
+        print(repr(table) + "\n")
+        print(f"Total parameters: {total_params}")
